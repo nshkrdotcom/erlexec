@@ -371,7 +371,8 @@ bool process_command(bool is_err)
                 return true;
             }
 
-            children.emplace(realpid, CmdInfo(true, po.kill_cmd(), realpid, po.success_exit_code(),
+            children.emplace(realpid, CmdInfo(true, po.kill_cmd(), po.kill_cmd_shell(),
+                                              realpid, po.success_exit_code(),
                                               po.kill_group(), po.dbg(), po.kill_timeout()));
 
             // Set nice priority for managed process if option is present
@@ -398,7 +399,7 @@ bool process_command(bool is_err)
             if ((pid = start_child(po, err)) < 0)
                 send_error_str(transId, false, "Couldn't start pid: %s", err.c_str());
             else {
-                children.emplace(pid, CmdInfo(po.cmd(), po.kill_cmd(), pid,
+                children.emplace(pid, CmdInfo(po.cmd(), po.kill_cmd(), po.kill_cmd_shell(), pid,
                                               getpgid(pid),
                                               po.success_exit_code(), false,
                                               po.stream_fd(STDIN_FILENO),

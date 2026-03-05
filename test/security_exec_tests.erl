@@ -16,14 +16,27 @@ security_exec_test_() ->
         %% Policy gate: shell commands
         {"shell string denied by default",       ?_test(shell_string_denied_by_default())},
         {"shell binary denied by default",       ?_test(shell_binary_denied_by_default())},
+        {"shell string works when enabled",      ?_test(shell_string_works_when_enabled())},
         {"argv list allowed when shell denied",  ?_test(argv_allowed_when_shell_denied())},
+        {"legacy shell argv remains allowed",    ?_test(legacy_shell_argv_remains_allowed())},
+        {"strict shell argv denied by default",  ?_test(strict_shell_argv_denied_by_default())},
+        {"strict env shell argv denied",         ?_test(strict_env_shell_argv_denied())},
+        {"strict shell argv works when enabled", ?_test(strict_shell_argv_works_when_enabled())},
         %% Policy gate: custom kill commands
         {"custom kill denied by default",        ?_test(custom_kill_command_denied_by_default())},
         {"custom kill requires shell gate",      ?_test(custom_kill_requires_shell_gate())},
+        {"argv custom kill works without shell", ?_test(argv_custom_kill_works_without_shell())},
+        {"strict argv custom kill works without shell",
+         ?_test(strict_argv_custom_kill_works_without_shell())},
+        {"legacy shell argv kill remains allowed",
+         ?_test(legacy_shell_argv_custom_kill_remains_allowed())},
+        {"strict shell argv kill denied",        ?_test(strict_shell_argv_custom_kill_denied())},
         {"custom kill works when enabled",       ?_test(custom_kill_command_works_when_enabled())},
         %% Port startup argument injection
         {"port args not shell-evaluated",        ?_test(port_startup_args_are_not_shell_evaluated())},
         %% Port protocol safety (behavioral)
+        {"invalid port payload stops exec",      ?_test(invalid_port_payload_stops_exec())},
+        {"unsafe port payload stops exec",       ?_test(unsafe_port_payload_stops_exec())},
         {"safe binary_to_term rejects unknown atoms", ?_test(safe_binary_to_term_rejects_unknown_atoms())},
         %% User option type normalization
         {"user atom matches limit_users string", ?_test(user_atom_matches_limit_users_string())},
@@ -73,10 +86,40 @@ shell_binary_denied_by_default() ->
                      exec:run(<<"echo blocked">>, [sync, stdout]))
     end).
 
+shell_string_works_when_enabled() ->
+    with_exec([{allow_shell_commands, true}], fun() ->
+        ?assertMatch({ok, [{stdout, [<<"enabled\n">>]}]},
+                     exec:run("echo enabled", [sync, stdout]))
+    end).
+
 argv_allowed_when_shell_denied() ->
     with_exec([], fun() ->
         ?assertMatch({ok, [{stdout, [<<"allowed\n">>]}]},
                      exec:run(["/bin/echo", "allowed"], [sync, stdout]))
+    end).
+
+legacy_shell_argv_remains_allowed() ->
+    with_exec([], fun() ->
+        ?assertMatch({ok, [{stdout, [<<"legacy\n">>]}]},
+                     exec:run(["/bin/sh", "-c", "echo legacy"], [sync, stdout]))
+    end).
+
+strict_shell_argv_denied_by_default() ->
+    with_exec([{shell_policy, strict}], fun() ->
+        ?assertMatch({error, shell_commands_not_allowed},
+                     exec:run(["/bin/sh", "-c", "echo blocked"], [sync, stdout]))
+    end).
+
+strict_env_shell_argv_denied() ->
+    with_exec([{shell_policy, strict}], fun() ->
+        ?assertMatch({error, shell_commands_not_allowed},
+                     exec:run(["/usr/bin/env", "sh", "-c", "echo blocked"], [sync, stdout]))
+    end).
+
+strict_shell_argv_works_when_enabled() ->
+    with_exec([{shell_policy, strict}, {allow_shell_commands, true}], fun() ->
+        ?assertMatch({ok, [{stdout, [<<"strict\n">>]}]},
+                     exec:run(["/bin/sh", "-c", "echo strict"], [sync, stdout]))
     end).
 
 %%----------------------------------------------------------------------
@@ -95,6 +138,40 @@ custom_kill_requires_shell_gate() ->
         ?assertMatch({error, shell_commands_not_allowed},
                      exec:run(["/bin/sleep", "1"],
                               [{kill, "touch /tmp/erlexec_should_not_run; kill ${CHILD_PID}"}]))
+    end).
+
+argv_custom_kill_works_without_shell() ->
+    with_exec([{allow_custom_kill_commands, true}], fun() ->
+        {ok, _, OsPid} = exec:run(["/bin/sleep", "30"],
+                                  [{kill, ["/bin/kill", "-TERM", "${CHILD_PID}"]},
+                                   {kill_timeout, 5}]),
+        ?assertEqual(ok, exec:stop(OsPid)),
+        ?assert(wait_until(fun() -> not pid_exists(OsPid) end, 50, 100))
+    end).
+
+strict_argv_custom_kill_works_without_shell() ->
+    with_exec([{allow_custom_kill_commands, true}, {shell_policy, strict}], fun() ->
+        {ok, _, OsPid} = exec:run(["/bin/sleep", "30"],
+                                  [{kill, ["/bin/kill", "-TERM", "${CHILD_PID}"]},
+                                   {kill_timeout, 5}]),
+        ?assertEqual(ok, exec:stop(OsPid)),
+        ?assert(wait_until(fun() -> not pid_exists(OsPid) end, 50, 100))
+    end).
+
+legacy_shell_argv_custom_kill_remains_allowed() ->
+    with_exec([{allow_custom_kill_commands, true}], fun() ->
+        {ok, _, OsPid} = exec:run(["/bin/sleep", "30"],
+                                  [{kill, ["/bin/sh", "-c", "kill \"$CHILD_PID\""]},
+                                   {kill_timeout, 5}]),
+        ?assertEqual(ok, exec:stop(OsPid)),
+        ?assert(wait_until(fun() -> not pid_exists(OsPid) end, 50, 100))
+    end).
+
+strict_shell_argv_custom_kill_denied() ->
+    with_exec([{allow_custom_kill_commands, true}, {shell_policy, strict}], fun() ->
+        ?assertMatch({error, shell_commands_not_allowed},
+                     exec:run(["/bin/sleep", "1"],
+                              [{kill, ["/bin/sh", "-c", "kill \"$CHILD_PID\""]}]))
     end).
 
 custom_kill_command_works_when_enabled() ->
@@ -124,6 +201,12 @@ port_startup_args_are_not_shell_evaluated() ->
 %%----------------------------------------------------------------------
 %% Port protocol safety (behavioral)
 %%----------------------------------------------------------------------
+
+invalid_port_payload_stops_exec() ->
+    fake_port_payload_stops_exec("invalid").
+
+unsafe_port_payload_stops_exec() ->
+    fake_port_payload_stops_exec("unsafe_atom").
 
 safe_binary_to_term_rejects_unknown_atoms() ->
     %% Verify that binary_to_term/2 with [safe] rejects atoms not in the
@@ -254,6 +337,45 @@ maybe_kill_pid(undefined) ->
 maybe_kill_pid(Pid) when is_integer(Pid), Pid > 0 ->
     _ = os:cmd("kill -9 " ++ integer_to_list(Pid) ++ " 2>/dev/null || true"),
     ok.
+
+wait_until(_Fun, 0, _SleepMs) ->
+    false;
+wait_until(Fun, Attempts, SleepMs) ->
+    case Fun() of
+        true ->
+            true;
+        false ->
+            timer:sleep(SleepMs),
+            wait_until(Fun, Attempts - 1, SleepMs)
+    end.
+
+fake_port_payload_stops_exec(Mode) ->
+    PidFile = temp_file("fake_port_pid"),
+    _ = file:delete(PidFile),
+    {ok, ExecPid} = exec:start([{portexe, fake_exec_port_path()},
+                                {env, [{"ERLEXEC_FAKE_PORT_MODE", Mode},
+                                       {"ERLEXEC_FAKE_PORT_EMIT_DELAY_MS", "500"},
+                                       {"ERLEXEC_FAKE_PORT_SLEEP_MS", "1000"},
+                                       {"ERLEXEC_FAKE_PORT_PID_FILE", PidFile}]}]),
+    Ref = erlang:monitor(process, ExecPid),
+    try
+        receive
+            {'DOWN', Ref, process, ExecPid, bad_port_message} ->
+                ok
+        after 5000 ->
+            ?assert(false)
+        end,
+        ?assertEqual(undefined, whereis(exec)),
+        PortPid = read_pid_file(PidFile, 20),
+        ?assert(is_integer(PortPid)),
+        ?assert(wait_until(fun() -> not pid_exists(PortPid) end, 50, 100))
+    after
+        maybe_kill_pid(read_pid_file(PidFile, 1)),
+        _ = file:delete(PidFile)
+    end.
+
+fake_exec_port_path() ->
+    filename:join(code:priv_dir(erlexec), "test/fake_exec_port.escript").
 
 %% Create an ETF binary encoding an atom, using the ATOM_EXT format
 %% directly so we don't actually create the atom in the current node.

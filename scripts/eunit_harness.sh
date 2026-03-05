@@ -3,7 +3,6 @@ set -euo pipefail
 
 MODE="${1:-fast}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-JOBS="${JOBS:-4}"
 
 usage() {
   cat <<'USAGE'
@@ -12,25 +11,24 @@ Usage:
 
 Modes:
   fast:
-    - Build C++ port in debug mode (OPTIMIZE=0)
-    - Compile Erlang modules with -DTEST
-    - Run EUnit once (default RUN_COUNT=900)
+    - Run canonical `rebar3 clean` followed by `rebar3 eunit` in debug mode (OPTIMIZE=0)
+    - Uses the standard rebar build/test path, including native pre-hooks
 
   full:
-    - Build C++ port in release mode (OPTIMIZE=3), run EUnit once (RUN_COUNT=900)
-    - Build C++ port in debug mode   (OPTIMIZE=0), run EUnit once (RUN_COUNT=900)
+    - Run canonical `rebar3 clean` + `rebar3 eunit` in release mode (OPTIMIZE=3)
+    - Run canonical `rebar3 clean` + `rebar3 eunit` in debug mode   (OPTIMIZE=0)
 
   stability:
-    - Build C++ port in debug mode (OPTIMIZE=0)
-    - Compile Erlang modules with -DTEST
-    - Run EUnit N times (default STABILITY_RUNS=10, RUN_COUNT=900)
+    - Run canonical `rebar3 clean` + `rebar3 eunit` in debug mode (OPTIMIZE=0)
+    - Repeat N times (default STABILITY_RUNS=10, RUN_COUNT=900)
     - Exits non-zero if any run fails.
 
 Environment overrides:
   RUN_COUNT=<int>         Concurrency count for exec_run_many_test_.
   PID_SLEEP_SEC=<int>     Optional value passed to tests (leave unset for test defaults).
   STABILITY_RUNS=<int>    Number of loop runs for stability mode.
-  JOBS=<int>              Parallel jobs for C++ build (default 4).
+  SANITIZE=<spec>         Optional sanitizer list passed to the native build.
+  CXX=<compiler>          Override the native compiler used by rebar pre-hooks.
 USAGE
 }
 
@@ -46,45 +44,58 @@ now_ms() {
   date +%s%3N
 }
 
-build_native() {
-  local optimize="$1"
-  local clean_first="${2:-1}"
-  echo "==> Building c_src (OPTIMIZE=$optimize)"
-  if [[ "$clean_first" == "1" ]]; then
-    (cd "$ROOT_DIR" && make -C c_src clean)
-  fi
-  (cd "$ROOT_DIR" && OPTIMIZE="$optimize" make -C c_src -j"$JOBS")
+otp_version() {
+  erl -noshell -noinput \
+    -eval 'io:format("~ts", [erlang:system_info(otp_release)]), halt(0).'
 }
 
-compile_erlang_tests() {
-  echo "==> Compiling Erlang modules with -DTEST"
-  mkdir -p "$ROOT_DIR/ebin"
-  find "$ROOT_DIR/ebin" -type f -delete
-  (cd "$ROOT_DIR" && erlc -DTEST -I include -o ebin src/*.erl test/*.erl)
+compiler_bin() {
+  if [[ -n "${CXX:-}" ]]; then
+    printf '%s\n' "$CXX"
+  elif command -v g++ >/dev/null 2>&1; then
+    printf '%s\n' "g++"
+  else
+    printf '%s\n' "c++"
+  fi
+}
+
+print_runtime_info() {
+  local compiler
+  compiler="$(compiler_bin)"
+  echo "HARNESS_MODE=$MODE"
+  echo "OTP_VERSION=$(otp_version)"
+  echo "REBAR3_VERSION=$(rebar3 version | head -n 1)"
+  echo "CXX=$compiler"
+  if command -v "$compiler" >/dev/null 2>&1; then
+    "$compiler" --version | head -n 1
+  fi
 }
 
 run_eunit_once() {
-  local run_count="$1"
-  local pid_sleep_sec="${2:-}"
+  local optimize="$1"
+  local sanitize="${2:-}"
+  local run_count="$3"
+  local pid_sleep_sec="${4:-}"
   local start end elapsed
+  local -a env_args
+
+  env_args=(
+    "OPTIMIZE=$optimize"
+    "SANITIZE=$sanitize"
+    "RUN_COUNT=$run_count"
+  )
+  if [[ -n "$pid_sleep_sec" ]]; then
+    env_args+=("PID_SLEEP_SEC=$pid_sleep_sec")
+  fi
 
   start="$(now_ms)"
-  if [[ -n "$pid_sleep_sec" ]]; then
-    (
-      cd "$ROOT_DIR" &&
-        RUN_COUNT="$run_count" \
-        PID_SLEEP_SEC="$pid_sleep_sec" \
-        erl -noshell -pa ebin \
-        -eval 'Res=eunit:test([exec,security_exec_tests],[verbose]), halt(case Res of ok -> 0; _ -> 1 end).'
-    )
-  else
-    (
-      cd "$ROOT_DIR" &&
-        RUN_COUNT="$run_count" \
-        erl -noshell -pa ebin \
-        -eval 'Res=eunit:test([exec,security_exec_tests],[verbose]), halt(case Res of ok -> 0; _ -> 1 end).'
-    )
-  fi
+  echo "==> Running rebar3 clean && rebar3 eunit (OPTIMIZE=$optimize SANITIZE=${sanitize:-none})"
+  (
+    cd "$ROOT_DIR" &&
+      env "${env_args[@]}" make -C c_src info &&
+      env "${env_args[@]}" rebar3 clean &&
+      env "${env_args[@]}" rebar3 eunit
+  )
   end="$(now_ms)"
   elapsed=$((end - start))
   echo "EUNIT_ELAPSED_MS=$elapsed"
@@ -92,8 +103,10 @@ run_eunit_once() {
 
 run_stability() {
   local runs="$1"
-  local run_count="$2"
-  local pid_sleep_sec="${3:-}"
+  local optimize="$2"
+  local sanitize="${3:-}"
+  local run_count="$4"
+  local pid_sleep_sec="${5:-}"
 
   local pass=0 fail=0 total_ms=0 max_ms=0 min_ms=0 elapsed=0
 
@@ -101,24 +114,7 @@ run_stability() {
     echo "==> Stability run $i/$runs"
     local start end
     start="$(now_ms)"
-    if [[ -n "$pid_sleep_sec" ]]; then
-      if (
-        cd "$ROOT_DIR" &&
-          RUN_COUNT="$run_count" \
-          PID_SLEEP_SEC="$pid_sleep_sec" \
-          erl -noshell -pa ebin \
-          -eval 'Res=eunit:test([exec,security_exec_tests],[verbose]), halt(case Res of ok -> 0; _ -> 1 end).'
-      ); then
-        pass=$((pass + 1))
-      else
-        fail=$((fail + 1))
-      fi
-    elif (
-      cd "$ROOT_DIR" &&
-        RUN_COUNT="$run_count" \
-        erl -noshell -pa ebin \
-        -eval 'Res=eunit:test([exec,security_exec_tests],[verbose]), halt(case Res of ok -> 0; _ -> 1 end).'
-    ); then
+    if run_eunit_once "$optimize" "$sanitize" "$run_count" "$pid_sleep_sec"; then
       pass=$((pass + 1))
     else
       fail=$((fail + 1))
@@ -147,32 +143,25 @@ run_stability() {
 }
 
 main() {
+  require_cmd rebar3
   require_cmd make
   require_cmd erl
-  require_cmd erlc
 
   local run_count="${RUN_COUNT:-}"
+  local sanitize="${SANITIZE:-}"
+  print_runtime_info
 
   case "$MODE" in
     fast)
-      build_native 0
-      compile_erlang_tests
-      run_eunit_once "${run_count:-900}" "${PID_SLEEP_SEC:-}"
+      run_eunit_once 0 "$sanitize" "${run_count:-900}" "${PID_SLEEP_SEC:-}"
       ;;
     full)
-      build_native 3
-      compile_erlang_tests
-      run_eunit_once "${run_count:-900}" "${PID_SLEEP_SEC:-}"
-
-      build_native 0
-      compile_erlang_tests
-      run_eunit_once "${run_count:-900}" "${PID_SLEEP_SEC:-}"
+      run_eunit_once 3 "$sanitize" "${run_count:-900}" "${PID_SLEEP_SEC:-}"
+      run_eunit_once 0 "$sanitize" "${run_count:-900}" "${PID_SLEEP_SEC:-}"
       ;;
     stability)
       local stability_runs="${STABILITY_RUNS:-10}"
-      build_native 0
-      compile_erlang_tests
-      run_stability "$stability_runs" "${run_count:-900}" "${PID_SLEEP_SEC:-}"
+      run_stability "$stability_runs" 0 "$sanitize" "${run_count:-900}" "${PID_SLEEP_SEC:-}"
       ;;
     -h|--help|help)
       usage

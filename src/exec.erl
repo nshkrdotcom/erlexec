@@ -95,6 +95,7 @@ versa.
     registry,                   % Pids to notify when an OsPid exits
     debug       = false,
     root        = false,
+    shell_policy = legacy,
     allow_manage_external_pids = false,
     allow_shell_commands       = false,
     allow_custom_kill_commands = false
@@ -157,18 +158,30 @@ sudo pkg ins valgrind                # FreeBSD
 - `allow_manage_external_pids | {allow_manage_external_pids, Boolean}`
   : Allow/disallow `manage/2` for arbitrary external OS pids.
     Disabled by default.
+- `{shell_policy, Policy}`
+  : Shell-command classification policy. `legacy` preserves the
+    historical behavior where only shell-string commands are gated.
+    `strict` also classifies argv-form shell interpreter invocations
+    (for example `["/bin/sh", "-c", "echo ok"]` or
+    `["/usr/bin/env", "sh", "-c", "echo ok"]`) as shell commands.
+    Default: `legacy`.
 - `allow_shell_commands | {allow_shell_commands, Boolean}`
   : Allow/disallow shell-string and shell-binary commands in `run/2`.
+    When `{shell_policy, strict}` is enabled this also gates argv-form
+    shell interpreter invocations and argv-form custom kill commands
+    that invoke a shell interpreter.
     Disabled by default.
 - `allow_custom_kill_commands | {allow_custom_kill_commands, Boolean}`
   : Allow/disallow `{kill, Cmd}` command option.
     Disabled by default.
 """.
+-type shell_policy() :: legacy | strict.
 -type exec_option()  ::
       debug
     | {debug, integer()}
     | root | {root, boolean()}
     | verbose
+    | {shell_policy, shell_policy()}
     | allow_manage_external_pids | {allow_manage_external_pids, boolean()}
     | allow_shell_commands | {allow_shell_commands, boolean()}
     | allow_custom_kill_commands | {allow_custom_kill_commands, boolean()}
@@ -181,7 +194,7 @@ sudo pkg ins valgrind                # FreeBSD
     | valgrind
     | {valgrind, string()}
     .
--export_type([exec_option/0, exec_options/0]).
+-export_type([exec_option/0, exec_options/0, shell_policy/0]).
 
 -doc """
 Command to be executed. If specified as a string, the specified command
@@ -219,9 +232,14 @@ involving the shell process, so the list of strings
 represents the program to be executed given with a full path,
 followed by the list of arguments (e.g. `["/bin/echo", "ok"]`).
 In this case all shell-based features are disabled
-and there's no shell injection vulnerability.
+and there's no shell injection vulnerability, unless you
+intentionally execute a shell interpreter as argv (for example
+`["/bin/sh", "-c", "echo ok"]`). The default `{shell_policy, legacy}`
+keeps that historical behavior. Use `{shell_policy, strict}` to
+treat argv-form shell interpreter invocations as shell commands.
 """.
--type cmd() :: binary() | string() | [string()].
+-type cmd_arg() :: string() | binary().
+-type cmd() :: binary() | string() | [cmd_arg()].
 -export_type([cmd/0]).
 
 -type cmd_options() :: [cmd_option()].
@@ -268,7 +286,9 @@ Command options:
     a 5-sec timeout if the process is still alive, it'll be
     killed with SIGKILL. The kill command will have a `CHILD_PID`
     environment variable set to the pid of the process it is
-    expected to kill.  If the `kill` option is not specified,
+    expected to kill. When given in argv form, every argv element
+    also supports `${CHILD_PID}` placeholder substitution without
+    involving a shell. If the `kill` option is not specified,
     by default first the command is sent a `SIGTERM` signal,
     followed by `SIGKILL` after a default timeout.
 - `{kill_timeout, Sec::integer()}`
@@ -326,7 +346,7 @@ Command options:
     | {executable, string()|binary()}
     | {cd, WorkDir::string()|binary()}
     | {env, [string() | clear | {Name::string()|binary(), Val::string()|binary()|false}, ...]}
-    | {kill, KillCmd::string()|binary()}
+    | {kill, KillCmd::cmd()}
     | {kill_timeout, Sec::non_neg_integer()}
     | kill_group
     | {group, GID :: string()|binary() | integer()}
@@ -736,6 +756,7 @@ default() ->
     [{debug, 0},        % Debug mode of the port program.
      {verbose, false},  % Verbose print of events on the Erlang side.
      {root, false},     % Allow running processes as root.
+     {shell_policy, legacy},
      {allow_manage_external_pids, false},
      {allow_shell_commands, false},
      {allow_custom_kill_commands, false},
@@ -831,6 +852,7 @@ init([Options]) ->
     User  = to_list(proplists:get_value(user,Options)),
     Debug = proplists:get_value(verbose,     Options, default(verbose)),
     Root  = proplists:get_value(root,        Options, default(root)),
+    ShellPolicy = normalize_shell_policy(proplists:get_value(shell_policy, Options, default(shell_policy))),
     AllowManageExternalPids = proplists:get_bool(allow_manage_external_pids, Options),
     AllowShellCommands = proplists:get_bool(allow_shell_commands, Options),
     AllowCustomKillCommands = proplists:get_bool(allow_custom_kill_commands, Options),
@@ -880,6 +902,7 @@ init([Options]) ->
         after 350 ->
             Tab = ets:new(exec_mon, [protected,named_table]),
             {ok, #state{port=Port, limit_users=Users, debug=Debug, registry=Tab, root=Root,
+                        shell_policy=ShellPolicy,
                         allow_manage_external_pids=AllowManageExternalPids,
                         allow_shell_commands=AllowShellCommands,
                         allow_custom_kill_commands=AllowCustomKillCommands}}
@@ -1183,6 +1206,7 @@ check_options(Options) when is_list(Options) ->
     Users = proplists:get_value(limit_users, Options, default(limit_users)),
     User  = proplists:get_value(user,        Options),
     Root  = proplists:get_value(root,        Options, default(root)),
+    ShellPolicy = proplists:get_value(shell_policy, Options, default(shell_policy)),
     % When instructing to run as root, check that the port program has
     % the SUID bit set or else use "sudo"
     Exe   = case proplists:get_value(portexe, Options, undefined) of
@@ -1190,23 +1214,24 @@ check_options(Options) when is_list(Options) ->
                 Other     -> Other
             end,
     {SUID,NeedSudo} = is_suid_and_root_owner(Exe),
-    if Root, (User==undefined orelse User=="" orelse User == <<"">>) ->
+    case lists:member(ShellPolicy, [legacy, strict]) of
+    false ->
+        {error, {invalid_shell_policy, ShellPolicy}};
+    true when Root, (User==undefined orelse User=="" orelse User == <<"">>) ->
         % Asked to enable root, but User is not set
         {error, "Not allowed to run without providing effective user {user,User}!"};
-    Root, Users==[] ->
+    true when Root, Users==[] ->
         % Asked to enable root, have SUID
         {error, "Not allowed to run without restricting effective users {limit_users,Users}!"};
-    Root, User/=undefined, User/="", Users/=[] ->
+    true when Root, User/=undefined, User/="", Users/=[] ->
         ok;
-    not Root, SUID, not NeedSudo, Users==[] ->
+    true when not Root, SUID, not NeedSudo, Users==[] ->
         {error, "Not allowed to run as SUID root without restricting effective users {limit_users,Users}!"};
-    not Root, User/=undefined ->
+    true when not Root, User/=undefined ->
         {error, "Cannot specify effective user {user,User} in non-root mode!"};
-        ok;
-    not Root, Users/=[] ->
+    true when not Root, Users/=[] ->
         {error, "Cannot restrict users {limit_users,Users} in non-root mode!"};
-        ok;
-    not Root ->
+    true when not Root ->
         ok;
     true ->
         {error, "Invalid root and user arguments"}
@@ -1244,19 +1269,7 @@ get_transaction(Q, I, OldQ) ->
 is_port_command({{run, Cmd, Options}, Link, Sync}, Pid, State) ->
     ensure_shell_command_allowed(Cmd, State),
     {PortOpts, Other} = check_cmd_options(Options, Pid, State, [], []),
-    %% If Cmd is a printable string, handle it as a unicode binary string.
-    %% Otherwise if it is a list of strings, convert them to list of unicode binaries.
-    Exe = case io_lib:printable_unicode_list(Cmd) of
-          true  -> unicode:characters_to_binary(Cmd);
-          false ->
-              F = fun(I) when is_binary(I) -> I;
-                     (I) when is_list(I)   -> unicode:characters_to_binary(I)
-                  end,
-              case is_list(Cmd) of
-              true  -> [F(I) || I <- Cmd];
-              false -> Cmd
-              end
-          end,
+    Exe = normalize_command(Cmd),
     {ok, {run, Exe, PortOpts}, Link, Sync, Other};
 is_port_command({list} = T, _Pid, _State) ->
     {ok, T, undefined, undefined, []};
@@ -1328,17 +1341,136 @@ decode_port_msg(Bin) ->
 
 ensure_shell_command_allowed(_Cmd, #state{allow_shell_commands=true}) ->
     ok;
-ensure_shell_command_allowed(Cmd, #state{allow_shell_commands=false}) ->
-    case is_shell_command(Cmd) of
+ensure_shell_command_allowed(Cmd, #state{allow_shell_commands=false, shell_policy=ShellPolicy}) ->
+    case is_shell_command(Cmd, ShellPolicy) of
     true  -> throw({error, shell_commands_not_allowed});
     false -> ok
     end.
 
-is_shell_command(Cmd) when is_binary(Cmd) ->
+is_shell_command(Cmd, legacy) when is_binary(Cmd) ->
     true;
-is_shell_command(Cmd) when is_list(Cmd) ->
+is_shell_command(Cmd, legacy) when is_list(Cmd) ->
     io_lib:printable_unicode_list(Cmd);
-is_shell_command(_) ->
+is_shell_command(Cmd, strict) ->
+    is_shell_command(Cmd, legacy) orelse argv_invokes_shell(Cmd);
+is_shell_command(_, _) ->
+    false.
+
+normalize_command(Cmd) when is_binary(Cmd) ->
+    Cmd;
+normalize_command(Cmd) when is_list(Cmd) ->
+    case io_lib:printable_unicode_list(Cmd) of
+        true ->
+            unicode:characters_to_binary(Cmd);
+        false ->
+            [normalize_command_arg(Arg) || Arg <- Cmd]
+    end;
+normalize_command(_) ->
+    throw({error, badarg}).
+
+normalize_command_arg(Arg) when is_binary(Arg) ->
+    Arg;
+normalize_command_arg(Arg) when is_list(Arg) ->
+    try
+        unicode:characters_to_binary(Arg)
+    catch
+        error:badarg ->
+            throw({error, badarg})
+    end;
+normalize_command_arg(_) ->
+    throw({error, badarg}).
+
+normalize_shell_policy(legacy) -> legacy;
+normalize_shell_policy(strict) -> strict;
+normalize_shell_policy(Other) -> throw({error, {invalid_shell_policy, Other}}).
+
+argv_invokes_shell(Cmd) ->
+    case command_argv(Cmd) of
+        {ok, Argv} ->
+            argv_invokes_shell_argv(Argv, 3);
+        error ->
+            false
+    end.
+
+command_argv(Cmd) when is_list(Cmd) ->
+    case io_lib:printable_unicode_list(Cmd) of
+        true ->
+            error;
+        false ->
+            try
+                {ok, [command_argv_arg(Arg) || Arg <- Cmd]}
+            catch
+                throw:badarg ->
+                    error
+            end
+    end;
+command_argv(_) ->
+    error.
+
+command_argv_arg(Arg) when is_binary(Arg) ->
+    binary_to_list(Arg);
+command_argv_arg(Arg) when is_list(Arg) ->
+    Arg;
+command_argv_arg(_) ->
+    throw(badarg).
+
+argv_invokes_shell_argv([], _Depth) ->
+    false;
+argv_invokes_shell_argv(_, Depth) when Depth =< 0 ->
+    false;
+argv_invokes_shell_argv([Exe | Rest], Depth) ->
+    case filename:basename(Exe) of
+        Shell when Shell =:= "sh"; Shell =:= "bash"; Shell =:= "dash";
+                   Shell =:= "ash"; Shell =:= "zsh"; Shell =:= "ksh";
+                   Shell =:= "mksh"; Shell =:= "fish"; Shell =:= "csh";
+                   Shell =:= "tcsh"; Shell =:= "busybox"; Shell =:= "toybox";
+                   Shell =:= "pwsh"; Shell =:= "powershell" ->
+            case Shell of
+                "busybox" -> busybox_invokes_shell(Rest, Depth - 1);
+                "toybox" -> busybox_invokes_shell(Rest, Depth - 1);
+                _ -> true
+            end;
+        "env" ->
+            env_invokes_shell(Rest, Depth - 1);
+        _ ->
+            false
+    end.
+
+env_invokes_shell(Args, Depth) ->
+    case skip_env_prefix(Args) of
+        [Exe | Rest] -> argv_invokes_shell_argv([Exe | Rest], Depth);
+        _ -> false
+    end.
+
+skip_env_prefix(["-i" | Rest]) ->
+    skip_env_prefix(Rest);
+skip_env_prefix(["--ignore-environment" | Rest]) ->
+    skip_env_prefix(Rest);
+skip_env_prefix(["-0" | Rest]) ->
+    skip_env_prefix(Rest);
+skip_env_prefix(["--null" | Rest]) ->
+    skip_env_prefix(Rest);
+skip_env_prefix(["-v" | Rest]) ->
+    skip_env_prefix(Rest);
+skip_env_prefix(["--debug" | Rest]) ->
+    skip_env_prefix(Rest);
+skip_env_prefix(["-S" | _Rest]) ->
+    [];
+skip_env_prefix(["--split-string" | _Rest]) ->
+    [];
+skip_env_prefix(["-u", _Var | Rest]) ->
+    skip_env_prefix(Rest);
+skip_env_prefix([Arg | Rest]) ->
+    case string:find(Arg, "=") of
+        nomatch -> [Arg | Rest];
+        _ -> skip_env_prefix(Rest)
+    end;
+skip_env_prefix([]) ->
+    [].
+
+busybox_invokes_shell([Subcommand | Rest], Depth) ->
+    argv_invokes_shell_argv([Subcommand | Rest], Depth);
+busybox_invokes_shell([], _Depth) ->
     false.
 
 check_cmd_options([monitor|T], Pid, State, PortOpts, OtherOpts) ->
@@ -1364,9 +1496,9 @@ check_cmd_options([{env, Env}=H|T], Pid, State, PortOpts, OtherOpts) when is_lis
 check_cmd_options([{kill, _Cmd}|_], _Pid, #state{allow_custom_kill_commands=false},
                   _PortOpts, _OtherOpts) ->
     throw({error, custom_kill_commands_not_allowed});
-check_cmd_options([{kill, Cmd}=H|T], Pid, State, PortOpts, OtherOpts) when is_list(Cmd); is_binary(Cmd) ->
+check_cmd_options([{kill, Cmd}|T], Pid, State, PortOpts, OtherOpts) when is_list(Cmd); is_binary(Cmd) ->
     ensure_shell_command_allowed(Cmd, State),
-    check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
+    check_cmd_options(T, Pid, State, [{kill, normalize_command(Cmd)} | PortOpts], OtherOpts);
 check_cmd_options([{kill_timeout, I}=H|T], Pid, State, PortOpts, OtherOpts) when is_integer(I), I >= 0 ->
     check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
 check_cmd_options([kill_group=H|T], Pid, State, PortOpts, OtherOpts) ->
@@ -1902,7 +2034,7 @@ test_pty() ->
 
 test_pty_echo() ->
     % without echo
-    {ok, _, I} = exec:run("echo started && cat", [
+    {ok, P, I} = exec:run("echo started && cat", [
         stdin,
         stdout,
         {stderr, stdout},
@@ -1913,8 +2045,9 @@ test_pty_echo() ->
     ok = exec:send(I, <<"test\n">>),
     ?receiveBytes({stdout, I, <<"test\r\n">>}, 5000),
     ok = exec:kill(I, 9),
+    ?receivePattern({'DOWN', I, process, P, {exit_status, 9}}, 5000),
     % with echo
-    {ok, _, I2} = exec:run("echo started && cat", [
+    {ok, P2, I2} = exec:run("echo started && cat", [
         stdin,
         stdout,
         {stderr, stdout},
@@ -1924,7 +2057,9 @@ test_pty_echo() ->
     ]),
     ?receiveBytes({stdout, I2, <<"started\r\n">>}, 5000),
     ok = exec:send(I2, <<"test\n">>),
-    ?receiveBytes({stdout, I2, <<"test\r\ntest\r\n">>}, 5000).
+    ?receiveBytes({stdout, I2, <<"test\r\ntest\r\n">>}, 5000),
+    ok = exec:kill(I2, 9),
+    ?receivePattern({'DOWN', I2, process, P2, {exit_status, 9}}, 5000).
 
 test_pty_opts() ->
     ?AssertMatch({error,[{exit_status,256},{stdout,[<<"not a tty\n">>]}]},
