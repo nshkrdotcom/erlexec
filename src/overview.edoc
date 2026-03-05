@@ -70,6 +70,26 @@ sudo setcap cap_setuid,cap_kill,cap_sys_nice+eip _build/default/lib/erlexec/priv
     capabilities).</li>
 </ol>
 
+== Security Policy Gates ==
+
+Starting with the latest version, erlexec enforces <b>default-deny</b> policies for
+potentially dangerous operations. The following features must be explicitly enabled
+at startup:
+
+<ul>
+<li>`allow_shell_commands' - Shell-string commands in `run/2' (e.g. `"echo ok"'). Default: `false'.</li>
+<li>`allow_custom_kill_commands' - `{kill, Cmd}' option for custom process termination. Default: `false'.</li>
+<li>`allow_manage_external_pids' - `manage/2' for arbitrary external OS pids. Default: `false'.</li>
+</ul>
+
+Argv-style commands (e.g. `["/bin/echo", "ok"]') are always allowed regardless
+of the `allow_shell_commands' setting.
+
+To restore the previous permissive behavior:
+```
+exec:start([allow_shell_commands, allow_custom_kill_commands, allow_manage_external_pids]).
+'''
+
 == Supported Platforms ==
 
 Linux, Solaris, and MacOS X.
@@ -112,7 +132,7 @@ is properly set prior to starting the emulator.
 
 === Starting/stopping an OS process ===
 ```
-1> exec:start([]).                                      % Start the port program.
+1> exec:start([allow_shell_commands]).                   % Start the port program.
 {ok,<0.32.0>}
 2> {ok, _, I} = exec:run_link("sleep 1000", []).        % Run a shell command to sleep for 1000s.
 {ok,<0.34.0>,23584}
@@ -183,7 +203,7 @@ $ whoami
 serge
 
 $ erl
-1> Opts = [root, {user, "wheel"}, {limit_users, ["alex","guest"]}],
+1> Opts = [root, {user, "wheel"}, {limit_users, ["alex","guest"]}, allow_shell_commands],
 2> exec:start(Opts).                                    % Start the port program as effective user "wheel"
                                                         % and allow it to execute commands as "alex" or "guest".
 {ok,<0.32.0>}
@@ -213,7 +233,7 @@ $ sudo _build/default/lib/erlexec/priv/*/exec-port --whoami
 root
 
 $ erl
-1> exec:start([root, {user, "root"}, {limit_users, ["root"]}]).
+1> exec:start([root, {user, "root"}, {limit_users, ["root"]}, allow_shell_commands]).
 2> exec:run("whoami", [sync, stdout]).
 {ok, [{stdout, [<<"root\n">>]}]}
 
@@ -305,6 +325,9 @@ ok
 '''
 
 === Managing an externally started OS process ===
+
+This feature requires `allow_manage_external_pids' to be enabled at startup.
+
 This command allows to instruct erlexec to begin monitoring given OS process
 and notify Erlang when the process exits. It is also able to send signals to
 the process and kill it.
@@ -342,6 +365,10 @@ ok
 '''
 
 === Specifying a custom kill command for a process ===
+
+This feature requires both `allow_shell_commands' and `allow_custom_kill_commands'
+to be enabled at startup.
+
 ```
 % Execute an OS process (script) that blocks SIGTERM, and uses a custom kill command,
 % which kills it with a SIGINT. Add a monitor so that we can wait for process exit
@@ -421,17 +448,21 @@ Got: {stdout,26143,<<"baz\nbar\nfoo\n">>}
 '''
 
 === Running OS commands with/without shell ===
+
+Shell-string commands require `allow_shell_commands' to be enabled at startup.
+Argv-style commands (lists) work without it.
+
 ```
-% Execute a command by an OS shell interpreter
-34> exec:run("/bin/echo ok", [sync, stdout]).
+% Execute a command by an OS shell interpreter (requires allow_shell_commands)
+34> exec:run("echo ok", [sync, stdout]).
 {ok, [{stdout, [<<"ok\n">>]}]}
 
-% Execute an executable without a shell
-35> exec:run(["/bin/echo", "ok"], [sync, stdout])).
+% Execute an executable without a shell (always allowed, no gate needed):
+35> exec:run(["/bin/echo", "ok"], [sync, stdout]).
 {ok, [{stdout, [<<"ok\n">>]}]}
 
-% Execute a shell with custom options
-36> exec:run(["/bin/bash", "-c", "echo ok"], [sync, stdout])).
+% Execute a shell with custom options (argv-style, always allowed):
+36> exec:run(["/bin/bash", "-c", "echo ok"], [sync, stdout]).
 {ok, [{stdout, [<<"ok\n">>]}]}
 '''
 
