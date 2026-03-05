@@ -1426,9 +1426,13 @@ check_cmd_options([{group, I}=H|T], Pid, State, PortOpts, OtherOpts) when is_int
 check_cmd_options([{user, U}|T], Pid, State, PortOpts, OtherOpts) when (is_list(U) andalso U =/= "")
                                                                      ; (is_binary(U) andalso U =/= <<"">>)
                                                                      ; is_atom(U) ->
-    case lists:member(U, State#state.limit_users) of
-    true  -> check_cmd_options(T, Pid, State, [{user,to_list(U)}|PortOpts], OtherOpts);
-    false -> throw({error, ?FMT("User ~s is not allowed to run commands!", [U])})
+    %% Normalize to string for consistent comparison against limit_users
+    %% (which is always stored as a list of strings). Without this, an atom
+    %% like 'root' would fail to match "root" in the limit_users list.
+    UStr = to_list(U),
+    case lists:member(UStr, State#state.limit_users) of
+    true  -> check_cmd_options(T, Pid, State, [{user,UStr}|PortOpts], OtherOpts);
+    false -> throw({error, ?FMT("User ~s is not allowed to run commands!", [UStr])})
     end;
 check_cmd_options([Other|_], _Pid, _State, _PortOpts, _OtherOpts) ->
     throw({error, {invalid_option, Other}});

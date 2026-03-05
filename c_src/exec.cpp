@@ -703,13 +703,47 @@ int finalize()
     TimeVal now(TimeVal::NOW);
     TimeVal deadline(now, FINALIZE_DEADLINE_SEC, 0);
 
-    while (!children.empty()) {
+    // Phase 1: Send initial SIGTERM to all managed children and their groups.
+    // This is the targeted replacement for the former kill(0, SIGTERM) which
+    // indiscriminately killed the entire process group (potentially including
+    // the BEAM VM if sharing a group).
+    for (const auto& child : children) {
+        pid_t pid = child.first;
+        if (pid == self_pid) continue;
+
+        if (child.second.kill_group &&
+            child.second.cmd_gid != std::numeric_limits<int>::max() &&
+            child.second.cmd_gid != 0) {
+            erl_exec_kill(-child.second.cmd_gid, SIGTERM, SRCLOC);
+        } else {
+            erl_exec_kill(pid, SIGTERM, SRCLOC);
+        }
+    }
+
+    // Phase 2: Iteratively stop children and drain transient kill-command pids.
+    // Loop continues while there are managed children OR outstanding transient
+    // kill-command processes. The old code only checked children, which could
+    // leave custom kill helpers running after finalize returned.
+    while (!children.empty() || !transient_pids.empty()) {
         now.now();
+
+        if (deadline < now) {
+            DEBUG(debug, "Finalize deadline exceeded, force-killing remaining children");
+            // Force-kill everything remaining
+            for (const auto& child : children)
+                erl_exec_kill(child.first, SIGKILL, SRCLOC);
+            for (const auto& tp : transient_pids)
+                erl_exec_kill(tp.first, SIGKILL, SRCLOC);
+            break;
+        }
+
         if (!children.empty() || !exited_children.empty()) {
             bool term = false;
             check_children(now, term, pipe_valid);
         }
 
+        // Snapshot children pids to avoid iterator invalidation:
+        // stop_child() may call erase_child() or insert into transient_pids.
         std::list<pid_t> managed_pids;
         for (const auto& child : children)
             managed_pids.push_back(child.first);
@@ -720,11 +754,13 @@ int finalize()
                 stop_child(it->second, 0, now, false);
         }
 
-        // Check if we need to kill the custom kill commands, but give then enough
-        // time to execute the kill action.
+        // Reap transient kill-command pids that have exceeded their deadline.
         for (auto it=transient_pids.begin(); it != transient_pids.end();) {
             auto& pid_deadline = it->second.second;
-            if ((now - pid_deadline).millisec() < 100) {
+            // Check if the kill command's deadline has passed.
+            // diff() returns (pid_deadline - now) in seconds; if <= 0, deadline
+            // has passed. We allow 100ms grace.
+            if (pid_deadline.diff(now) > 0.1) {
                 ++it;
                 continue;
             }
@@ -733,7 +769,7 @@ int finalize()
             it = transient_pids.erase(it);
         }
 
-        if (children.empty())
+        if (children.empty() && transient_pids.empty())
             break;
 
         FdHandler fdhandler;
@@ -759,6 +795,19 @@ int finalize()
                     if (!process_sigchld())
                         break;
             }
+        }
+    }
+
+    // Phase 3: Final orphan reap sweep.
+    // Catch any children we may have missed (e.g., processes spawned between
+    // fork() and children map insertion, or grandchildren in our process group).
+    // This replaces the old kill(0, SIGTERM) safety net with a non-destructive
+    // waitpid sweep that only reaps our own children.
+    {
+        int status;
+        pid_t pid;
+        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            DEBUG(debug, "Reaped orphaned child pid %d (status=%d) during finalize", pid, status);
         }
     }
 
