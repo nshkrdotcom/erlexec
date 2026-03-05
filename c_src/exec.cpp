@@ -703,22 +703,26 @@ int finalize()
     TimeVal now(TimeVal::NOW);
     TimeVal deadline(now, FINALIZE_DEADLINE_SEC, 0);
 
-    // Phase 1: Send initial SIGTERM to all managed children and their groups.
-    // This is the targeted replacement for the former kill(0, SIGTERM) which
-    // indiscriminately killed the entire process group (potentially including
-    // the BEAM VM if sharing a group).
-    for (const auto& child : children) {
+    auto signal_child = [](const MapChildrenT::value_type& child, int sig) {
         pid_t pid = child.first;
-        if (pid == self_pid) continue;
+        if (pid == self_pid)
+            return;
 
         if (child.second.kill_group &&
             child.second.cmd_gid != std::numeric_limits<int>::max() &&
             child.second.cmd_gid != 0) {
-            erl_exec_kill(-child.second.cmd_gid, SIGTERM, SRCLOC);
+            erl_exec_kill(-child.second.cmd_gid, sig, SRCLOC);
         } else {
-            erl_exec_kill(pid, SIGTERM, SRCLOC);
+            erl_exec_kill(pid, sig, SRCLOC);
         }
-    }
+    };
+
+    // Phase 1: Send initial SIGTERM to all managed children and their groups.
+    // This is the targeted replacement for the former kill(0, SIGTERM) which
+    // indiscriminately killed the entire process group (potentially including
+    // the BEAM VM if sharing a group).
+    for (const auto& child : children)
+        signal_child(child, SIGTERM);
 
     // Phase 2: Iteratively stop children and drain transient kill-command pids.
     // Loop continues while there are managed children OR outstanding transient
@@ -731,7 +735,7 @@ int finalize()
             DEBUG(debug, "Finalize deadline exceeded, force-killing remaining children");
             // Force-kill everything remaining
             for (const auto& child : children)
-                erl_exec_kill(child.first, SIGKILL, SRCLOC);
+                signal_child(child, SIGKILL);
             for (const auto& tp : transient_pids)
                 erl_exec_kill(tp.first, SIGKILL, SRCLOC);
             break;

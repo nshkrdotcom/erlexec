@@ -19,6 +19,7 @@ security_exec_test_() ->
         {"argv list allowed when shell denied",  ?_test(argv_allowed_when_shell_denied())},
         %% Policy gate: custom kill commands
         {"custom kill denied by default",        ?_test(custom_kill_command_denied_by_default())},
+        {"custom kill requires shell gate",      ?_test(custom_kill_requires_shell_gate())},
         {"custom kill works when enabled",       ?_test(custom_kill_command_works_when_enabled())},
         %% Port startup argument injection
         {"port args not shell-evaluated",        ?_test(port_startup_args_are_not_shell_evaluated())},
@@ -27,7 +28,9 @@ security_exec_test_() ->
         %% User option type normalization
         {"user atom matches limit_users string", ?_test(user_atom_matches_limit_users_string())},
         %% Finalize: transient pid cleanup
-        {"finalize drains transient pids",       ?_test(finalize_drains_transient_pids())}
+        {"finalize drains transient pids",       ?_test(finalize_drains_transient_pids())},
+        {"finalize deadline kills process group",
+         {timeout, 30, ?_test(finalize_deadline_kills_process_group())}}
     ]}.
 
 %%----------------------------------------------------------------------
@@ -85,6 +88,13 @@ custom_kill_command_denied_by_default() ->
     with_exec([{allow_shell_commands, true}], fun() ->
         ?assertMatch({error, custom_kill_commands_not_allowed},
                      exec:run(["/bin/sleep", "1"], [{kill, "kill -9 ${CHILD_PID}"}]))
+    end).
+
+custom_kill_requires_shell_gate() ->
+    with_exec([{allow_custom_kill_commands, true}], fun() ->
+        ?assertMatch({error, shell_commands_not_allowed},
+                     exec:run(["/bin/sleep", "1"],
+                              [{kill, "touch /tmp/erlexec_should_not_run; kill ${CHILD_PID}"}]))
     end).
 
 custom_kill_command_works_when_enabled() ->
@@ -178,6 +188,27 @@ finalize_drains_transient_pids() ->
             end,
     ?assertNot(Alive).
 
+finalize_deadline_kills_process_group() ->
+    MarkerFile = temp_file("finalize_group_pid"),
+    _ = file:delete(MarkerFile),
+    {ok, ExecPid} = exec:start([]),
+    try
+        {ok, _, _} = exec:run(
+            ["/bin/bash", "-c",
+             "trap '' TERM; sleep 120 & echo $! > " ++ MarkerFile ++ "; wait"],
+            [{group, 0}, kill_group, {kill_timeout, 20}]),
+        GroupPid = read_pid_file(MarkerFile, 20),
+        ?assert(is_integer(GroupPid)),
+        timer:sleep(200),
+        exit(ExecPid, kill),
+        %% Wait until finalize crosses its internal 10-second deadline.
+        timer:sleep(12000),
+        ?assertNot(pid_exists(GroupPid))
+    after
+        maybe_kill_pid(read_pid_file(MarkerFile, 1)),
+        _ = file:delete(MarkerFile)
+    end.
+
 %%----------------------------------------------------------------------
 %% Helpers
 %%----------------------------------------------------------------------
@@ -198,6 +229,31 @@ temp_file(Prefix) ->
     end,
     {I1, I2, I3} = erlang:timestamp(),
     filename:join(Dir, io_lib:format("erlexec_~s_~w_~w_~w", [Prefix, I1, I2, I3])).
+
+read_pid_file(File, Attempts) ->
+    case file:read_file(File) of
+        {ok, Bin} ->
+            list_to_integer(string:trim(binary_to_list(Bin)));
+        {error, enoent} when Attempts > 0 ->
+            timer:sleep(100),
+            read_pid_file(File, Attempts - 1);
+        {error, _} ->
+            undefined
+    end.
+
+pid_exists(undefined) ->
+    false;
+pid_exists(Pid) when is_integer(Pid), Pid > 0 ->
+    case os:cmd("kill -0 " ++ integer_to_list(Pid) ++ " 2>/dev/null; echo $?") of
+        "0\n" -> true;
+        _     -> false
+    end.
+
+maybe_kill_pid(undefined) ->
+    ok;
+maybe_kill_pid(Pid) when is_integer(Pid), Pid > 0 ->
+    _ = os:cmd("kill -9 " ++ integer_to_list(Pid) ++ " 2>/dev/null || true"),
+    ok.
 
 %% Create an ETF binary encoding an atom, using the ATOM_EXT format
 %% directly so we don't actually create the atom in the current node.

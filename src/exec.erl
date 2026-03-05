@@ -1365,6 +1365,7 @@ check_cmd_options([{kill, _Cmd}|_], _Pid, #state{allow_custom_kill_commands=fals
                   _PortOpts, _OtherOpts) ->
     throw({error, custom_kill_commands_not_allowed});
 check_cmd_options([{kill, Cmd}=H|T], Pid, State, PortOpts, OtherOpts) when is_list(Cmd); is_binary(Cmd) ->
+    ensure_shell_command_allowed(Cmd, State),
     check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
 check_cmd_options([{kill_timeout, I}=H|T], Pid, State, PortOpts, OtherOpts) when is_integer(I), I >= 0 ->
     check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
