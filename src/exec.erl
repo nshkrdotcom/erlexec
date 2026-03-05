@@ -94,7 +94,10 @@ versa.
     limit_users = [],           % Restricted list of users allowed to run commands
     registry,                   % Pids to notify when an OsPid exits
     debug       = false,
-    root        = false
+    root        = false,
+    allow_manage_external_pids = false,
+    allow_shell_commands       = false,
+    allow_custom_kill_commands = false
 }).
 
 -type exec_options() :: [exec_option()].
@@ -151,12 +154,24 @@ sudo pkg ins valgrind                # FreeBSD
 - `{valgrind, Command}`
   : Same as `valgrind`, but allows to specify the Valgrind command
     and its options (e.g. "/path/to/valgrind --leak-check=full")
+- `allow_manage_external_pids | {allow_manage_external_pids, Boolean}`
+  : Allow/disallow `manage/2` for arbitrary external OS pids.
+    Disabled by default.
+- `allow_shell_commands | {allow_shell_commands, Boolean}`
+  : Allow/disallow shell-string and shell-binary commands in `run/2`.
+    Disabled by default.
+- `allow_custom_kill_commands | {allow_custom_kill_commands, Boolean}`
+  : Allow/disallow `{kill, Cmd}` command option.
+    Disabled by default.
 """.
 -type exec_option()  ::
       debug
     | {debug, integer()}
     | root | {root, boolean()}
     | verbose
+    | allow_manage_external_pids | {allow_manage_external_pids, boolean()}
+    | allow_shell_commands | {allow_shell_commands, boolean()}
+    | allow_custom_kill_commands | {allow_custom_kill_commands, boolean()}
     | {args, [string()|binary(), ...]}
     | {alarm, non_neg_integer()}
     | {user, string()|binary()}
@@ -721,6 +736,9 @@ default() ->
     [{debug, 0},        % Debug mode of the port program.
      {verbose, false},  % Verbose print of events on the Erlang side.
      {root, false},     % Allow running processes as root.
+     {allow_manage_external_pids, false},
+     {allow_shell_commands, false},
+     {allow_custom_kill_commands, false},
      {args, ""},        % Extra arguments that can be passed to port program
      {alarm, 12},
      {portexe, noportexe},
@@ -813,6 +831,9 @@ init([Options]) ->
     User  = to_list(proplists:get_value(user,Options)),
     Debug = proplists:get_value(verbose,     Options, default(verbose)),
     Root  = proplists:get_value(root,        Options, default(root)),
+    AllowManageExternalPids = proplists:get_bool(allow_manage_external_pids, Options),
+    AllowShellCommands = proplists:get_bool(allow_shell_commands, Options),
+    AllowCustomKillCommands = proplists:get_bool(allow_custom_kill_commands, Options),
     Valgr = case proplists:get_value(valgrind, Options) of
             true                  -> default(valgrind);
             Vg when is_list(Vg)   -> Vg ++ " ";
@@ -858,7 +879,10 @@ init([Options]) ->
                 {stop, {port_exited_with_status, Status}}
         after 350 ->
             Tab = ets:new(exec_mon, [protected,named_table]),
-            {ok, #state{port=Port, limit_users=Users, debug=Debug, registry=Tab, root=Root}}
+            {ok, #state{port=Port, limit_users=Users, debug=Debug, registry=Tab, root=Root,
+                        allow_manage_external_pids=AllowManageExternalPids,
+                        allow_shell_commands=AllowShellCommands,
+                        allow_custom_kill_commands=AllowCustomKillCommands}}
         end
     catch
         ?EXCEPTION(_, Reason, Stacktrace) ->
@@ -913,32 +937,37 @@ handle_cast(_Msg, State) ->
 %%          {stop, Reason, State}            (terminate/2 is called)
 %%----------------------------------------------------------------------
 handle_info({Port, {data, Bin}}, #state{port=Port, debug=Debug} = State) ->
-    Msg = binary_to_term(Bin),
-    debug(Debug, "~w got msg from port: ~p\n", [?MODULE, Msg]),
-    case Msg of
-    {N, Reply} when N =/= 0 ->
-        case get_transaction(State#state.trans, N) of
-        {true, {Pid,_} = From, MonType, Sync, PidOpts, Q} ->
-            NewReply = maybe_add_monitor(Reply, Pid, MonType, Sync, PidOpts, Debug),
-            gen_server:reply(From, NewReply);
-        {false, Q} ->
-            ok
-        end,
-        {noreply, State#state{trans=Q}};
-    {0, {Stream, OsPid, Data}} when Stream =:= stdout; Stream =:= stderr ->
-        send_to_ospid_owner(OsPid, {Stream, Data}),
-        {noreply, State};
-    {0, {exit_status, OsPid, Status}} ->
-        debug(Debug, "Pid ~w exited with status: ~s{~w,~w}\n",
-            [OsPid, if (((Status band 16#7F)+1) bsr 1) > 0 -> "signaled "; true -> "" end,
-             (Status band 16#FF00 bsr 8), Status band 127]),
-        notify_ospid_owner(OsPid, Status),
-        {noreply, State};
-    {0, ok} ->
-        {noreply, State};
-    {0, Ignore} ->
-        error_logger:warning_msg("~w [~w] unknown msg: ~p\n", [self(), ?MODULE, Ignore]),
-        {noreply, State}
+    case decode_port_msg(Bin) of
+    {ok, Msg} ->
+        debug(Debug, "~w got msg from port: ~p\n", [?MODULE, Msg]),
+        case Msg of
+        {N, Reply} when N =/= 0 ->
+            case get_transaction(State#state.trans, N) of
+            {true, {Pid,_} = From, MonType, Sync, PidOpts, Q} ->
+                NewReply = maybe_add_monitor(Reply, Pid, MonType, Sync, PidOpts, Debug),
+                gen_server:reply(From, NewReply);
+            {false, Q} ->
+                ok
+            end,
+            {noreply, State#state{trans=Q}};
+        {0, {Stream, OsPid, Data}} when Stream =:= stdout; Stream =:= stderr ->
+            send_to_ospid_owner(OsPid, {Stream, Data}),
+            {noreply, State};
+        {0, {exit_status, OsPid, Status}} ->
+            debug(Debug, "Pid ~w exited with status: ~s{~w,~w}\n",
+                [OsPid, if (((Status band 16#7F)+1) bsr 1) > 0 -> "signaled "; true -> "" end,
+                 (Status band 16#FF00 bsr 8), Status band 127]),
+            notify_ospid_owner(OsPid, Status),
+            {noreply, State};
+        {0, ok} ->
+            {noreply, State};
+        {0, Ignore} ->
+            error_logger:warning_msg("~w [~w] unknown msg: ~p\n", [self(), ?MODULE, Ignore]),
+            {noreply, State}
+        end;
+    {error, bad_port_message} ->
+        error_logger:error_msg("~w [~w] unsafe or invalid port payload: ~p\n", [self(), ?MODULE, Bin]),
+        {stop, bad_port_message, State}
     end;
 
 handle_info({Port, {exit_status, 0}}, #state{port=Port} = State) ->
@@ -1213,6 +1242,7 @@ get_transaction(Q, I, OldQ) ->
     end.
 
 is_port_command({{run, Cmd, Options}, Link, Sync}, Pid, State) ->
+    ensure_shell_command_allowed(Cmd, State),
     {PortOpts, Other} = check_cmd_options(Options, Pid, State, [], []),
     %% If Cmd is a printable string, handle it as a unicode binary string.
     %% Otherwise if it is a list of strings, convert them to list of unicode binaries.
@@ -1237,6 +1267,9 @@ is_port_command({stop, Pid}, _Pid, _State) when is_pid(Pid) ->
     [{_StoredPid, OsPid}] -> {ok, {stop, OsPid}, undefined, undefined, []};
     []              -> throw({error, no_process})
     end;
+is_port_command({{manage, _OsPid, _Options}, _Link, _Sync}, _Pid,
+                #state{allow_manage_external_pids=false}) ->
+    throw({error, manage_external_pids_disabled});
 is_port_command({{manage, OsPid, Options}, Link, Sync}, Pid, State) when is_integer(OsPid) ->
     {PortOpts, _Other} = check_cmd_options(Options, Pid, State, [], []),
     {ok, {manage, OsPid, PortOpts}, Link, Sync, []};
@@ -1286,6 +1319,28 @@ parse_env([{K,false}|T]) -> [{to_list(K), false}     |parse_env(T)]; %% Remove t
 parse_env([{K,V}|T])     -> [{to_list(K), to_list(V)}|parse_env(T)];
 parse_env([H|T])         -> [to_list(H)|parse_env(T)].
 
+decode_port_msg(Bin) ->
+    try
+        {ok, binary_to_term(Bin, [safe])}
+    catch
+        error:badarg -> {error, bad_port_message}
+    end.
+
+ensure_shell_command_allowed(_Cmd, #state{allow_shell_commands=true}) ->
+    ok;
+ensure_shell_command_allowed(Cmd, #state{allow_shell_commands=false}) ->
+    case is_shell_command(Cmd) of
+    true  -> throw({error, shell_commands_not_allowed});
+    false -> ok
+    end.
+
+is_shell_command(Cmd) when is_binary(Cmd) ->
+    true;
+is_shell_command(Cmd) when is_list(Cmd) ->
+    io_lib:printable_unicode_list(Cmd);
+is_shell_command(_) ->
+    false.
+
 check_cmd_options([monitor|T], Pid, State, PortOpts, OtherOpts) ->
     check_cmd_options(T, Pid, State, PortOpts, OtherOpts);
 check_cmd_options([sync|T], Pid, State, PortOpts, OtherOpts) ->
@@ -1306,6 +1361,9 @@ check_cmd_options([{env, Env}=H|T], Pid, State, PortOpts, OtherOpts) when is_lis
     [] -> check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
     L  -> throw({error, {invalid_env_value, L}})
     end;
+check_cmd_options([{kill, _Cmd}|_], _Pid, #state{allow_custom_kill_commands=false},
+                  _PortOpts, _OtherOpts) ->
+    throw({error, custom_kill_commands_not_allowed});
 check_cmd_options([{kill, Cmd}=H|T], Pid, State, PortOpts, OtherOpts) when is_list(Cmd); is_binary(Cmd) ->
     check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
 check_cmd_options([{kill_timeout, I}=H|T], Pid, State, PortOpts, OtherOpts) when is_integer(I), I >= 0 ->
@@ -1551,6 +1609,11 @@ temp_file() ->
     {I1, I2, I3}  = erlang:timestamp(),
     filename:join(Dir, io_lib:format("exec_temp_~w_~w_~w", [I1, I2, I3])).
 
+legacy_exec_test_opts() ->
+    [{allow_shell_commands, true},
+     {allow_custom_kill_commands, true},
+     {allow_manage_external_pids, true}].
+
 exec_test_() ->
     {setup,
         fun() ->
@@ -1565,7 +1628,7 @@ exec_test_() ->
                     false -> Opts;
                     _     -> [{debug, 1}, verbose | Opts]
                 end,
-            {ok, Pid} = exec:start(Opts1),
+            {ok, Pid} = exec:start(legacy_exec_test_opts() ++ Opts1),
             Pid
         end,
 
@@ -1609,7 +1672,7 @@ exec_run_many_test_() ->
             end,
     M     = N*2,
     {setup,
-        fun()    -> {ok, Pid} = exec:start([{debug, Level}]), Pid end,
+        fun()    -> {ok, Pid} = exec:start([{debug, Level} | legacy_exec_test_opts()]), Pid end,
         fun(Pid) -> exit(Pid, kill) end,
         [
             {timeout, 200,

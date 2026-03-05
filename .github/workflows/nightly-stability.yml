@@ -1,0 +1,26 @@
+name: nightly-stability
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  stability:
+    name: stability (otp 28)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+
+      - name: Run stability harness
+        env:
+          STABILITY_RUNS: "10"
+        run: bash scripts/eunit_harness.sh stability

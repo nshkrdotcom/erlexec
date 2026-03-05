@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  pull_request:
+    branches:
+      - master
+      - main
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+jobs:
+  fast:
+    name: fast (otp 28)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+
+      - name: Run fast harness
+        run: bash scripts/eunit_harness.sh fast
+
+  full:
+    name: full (otp 28)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: fast
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Erlang/OTP
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+
+      - name: Run full harness
+        run: bash scripts/eunit_harness.sh full

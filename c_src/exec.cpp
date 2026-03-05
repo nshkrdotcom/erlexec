@@ -700,8 +700,6 @@ int finalize()
     int old_terminated = terminated ? 1 : 0;
     terminated = false;
 
-    kill(0, SIGTERM); // Kill all children in our process group
-
     TimeVal now(TimeVal::NOW);
     TimeVal deadline(now, FINALIZE_DEADLINE_SEC, 0);
 
@@ -712,18 +710,27 @@ int finalize()
             check_children(now, term, pipe_valid);
         }
 
-        for(auto it=children.begin(), end=children.end(); it != end; ++it)
-            stop_child(it->second, 0, now, false);
+        std::list<pid_t> managed_pids;
+        for (const auto& child : children)
+            managed_pids.push_back(child.first);
+
+        for (pid_t pid : managed_pids) {
+            auto it = children.find(pid);
+            if (it != children.end())
+                stop_child(it->second, 0, now, false);
+        }
 
         // Check if we need to kill the custom kill commands, but give then enough
         // time to execute the kill action.
-        for(auto it=transient_pids.begin(), end=transient_pids.end(); it != end; ++it) {
+        for (auto it=transient_pids.begin(); it != transient_pids.end();) {
             auto& pid_deadline = it->second.second;
-            if ((now - pid_deadline).millisec() < 100)
+            if ((now - pid_deadline).millisec() < 100) {
+                ++it;
                 continue;
+            }
             if (child_exists(it->first))
                 erl_exec_kill(it->first, SIGKILL, SRCLOC);
-            transient_pids.erase(it);
+            it = transient_pids.erase(it);
         }
 
         if (children.empty())
