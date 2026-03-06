@@ -21,6 +21,11 @@ security_exec_test_() ->
         {"legacy shell argv remains allowed",    ?_test(legacy_shell_argv_remains_allowed())},
         {"strict shell argv denied by default",  ?_test(strict_shell_argv_denied_by_default())},
         {"strict env shell argv denied",         ?_test(strict_env_shell_argv_denied())},
+        {"strict executable override shell denied",
+         ?_test(strict_executable_override_shell_denied())},
+        {"strict env -- shell argv denied",      ?_test(strict_env_dashdash_shell_argv_denied())},
+        {"strict env -S shell argv denied",      ?_test(strict_env_split_string_shell_denied())},
+        {"strict env non-shell argv allowed",    ?_test(strict_env_non_shell_argv_allowed())},
         {"strict shell argv works when enabled", ?_test(strict_shell_argv_works_when_enabled())},
         %% Policy gate: custom kill commands
         {"custom kill denied by default",        ?_test(custom_kill_command_denied_by_default())},
@@ -31,6 +36,10 @@ security_exec_test_() ->
         {"legacy shell argv kill remains allowed",
          ?_test(legacy_shell_argv_custom_kill_remains_allowed())},
         {"strict shell argv kill denied",        ?_test(strict_shell_argv_custom_kill_denied())},
+        {"strict env -- shell argv kill denied",
+         ?_test(strict_env_dashdash_shell_argv_custom_kill_denied())},
+        {"strict env -S shell argv kill denied",
+         ?_test(strict_env_split_string_custom_kill_denied())},
         {"custom kill works when enabled",       ?_test(custom_kill_command_works_when_enabled())},
         %% Port startup argument injection
         {"port args not shell-evaluated",        ?_test(port_startup_args_are_not_shell_evaluated())},
@@ -116,6 +125,31 @@ strict_env_shell_argv_denied() ->
                      exec:run(["/usr/bin/env", "sh", "-c", "echo blocked"], [sync, stdout]))
     end).
 
+strict_executable_override_shell_denied() ->
+    with_exec([{shell_policy, strict}], fun() ->
+        ?assertMatch({error, shell_commands_not_allowed},
+                     exec:run(["notsh", "-c", "echo blocked"],
+                              [{executable, "/bin/sh"}, sync, stdout]))
+    end).
+
+strict_env_dashdash_shell_argv_denied() ->
+    with_exec([{shell_policy, strict}], fun() ->
+        ?assertMatch({error, shell_commands_not_allowed},
+                     exec:run(["/usr/bin/env", "--", "sh", "-c", "echo blocked"], [sync, stdout]))
+    end).
+
+strict_env_split_string_shell_denied() ->
+    with_exec([{shell_policy, strict}], fun() ->
+        ?assertMatch({error, shell_commands_not_allowed},
+                     exec:run(["/usr/bin/env", "-S", "sh -c \"echo blocked\""], [sync, stdout]))
+    end).
+
+strict_env_non_shell_argv_allowed() ->
+    with_exec([{shell_policy, strict}], fun() ->
+        ?assertMatch({ok, [{stdout, [<<"allowed\n">>]}]},
+                     exec:run(["/usr/bin/env", "--", "/bin/echo", "allowed"], [sync, stdout]))
+    end).
+
 strict_shell_argv_works_when_enabled() ->
     with_exec([{shell_policy, strict}, {allow_shell_commands, true}], fun() ->
         ?assertMatch({ok, [{stdout, [<<"strict\n">>]}]},
@@ -172,6 +206,22 @@ strict_shell_argv_custom_kill_denied() ->
         ?assertMatch({error, shell_commands_not_allowed},
                      exec:run(["/bin/sleep", "1"],
                               [{kill, ["/bin/sh", "-c", "kill \"$CHILD_PID\""]}]))
+    end).
+
+strict_env_dashdash_shell_argv_custom_kill_denied() ->
+    with_exec([{allow_custom_kill_commands, true}, {shell_policy, strict}], fun() ->
+        ?assertMatch({error, shell_commands_not_allowed},
+                     exec:run(["/bin/sleep", "1"],
+                              [{kill, ["/usr/bin/env", "--", "sh", "-c",
+                                       "kill \"$CHILD_PID\""]}]))
+    end).
+
+strict_env_split_string_custom_kill_denied() ->
+    with_exec([{allow_custom_kill_commands, true}, {shell_policy, strict}], fun() ->
+        ?assertMatch({error, shell_commands_not_allowed},
+                     exec:run(["/bin/sleep", "1"],
+                              [{kill, ["/usr/bin/env", "-S",
+                                       "sh -c \"kill \\\"$CHILD_PID\\\"\""]}]))
     end).
 
 custom_kill_command_works_when_enabled() ->

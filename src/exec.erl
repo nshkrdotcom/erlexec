@@ -1267,9 +1267,9 @@ get_transaction(Q, I, OldQ) ->
     end.
 
 is_port_command({{run, Cmd, Options}, Link, Sync}, Pid, State) ->
-    ensure_shell_command_allowed(Cmd, State),
     {PortOpts, Other} = check_cmd_options(Options, Pid, State, [], []),
     Exe = normalize_command(Cmd),
+    ensure_shell_command_allowed(Exe, PortOpts, State),
     {ok, {run, Exe, PortOpts}, Link, Sync, Other};
 is_port_command({list} = T, _Pid, _State) ->
     {ok, T, undefined, undefined, []};
@@ -1334,26 +1334,53 @@ parse_env([H|T])         -> [to_list(H)|parse_env(T)].
 
 decode_port_msg(Bin) ->
     try
-        {ok, binary_to_term(Bin, [safe])}
+        {ok, normalize_port_msg(binary_to_term(Bin, [safe]))}
     catch
         error:badarg -> {error, bad_port_message}
     end.
 
-ensure_shell_command_allowed(_Cmd, #state{allow_shell_commands=true}) ->
+normalize_port_msg({N, Reply}) when is_integer(N), N =/= 0 ->
+    {N, normalize_port_reply(Reply)};
+normalize_port_msg(Msg) ->
+    Msg.
+
+normalize_port_reply({error, Reason}) ->
+    {error, normalize_port_error(Reason)};
+normalize_port_reply(Reply) ->
+    Reply.
+
+normalize_port_error(Reason) when is_binary(Reason) ->
+    normalize_port_error(binary_to_list(Reason));
+normalize_port_error(Reason) when is_list(Reason) ->
+    case port_error_code_to_atom(Reason) of
+        {ok, Atom} -> Atom;
+        error -> Reason
+    end;
+normalize_port_error(Reason) ->
+    Reason.
+
+port_error_code_to_atom("badarg") -> {ok, badarg};
+port_error_code_to_atom("not_found") -> {ok, not_found};
+port_error_code_to_atom("eacces") -> {ok, eacces};
+port_error_code_to_atom("einval") -> {ok, einval};
+port_error_code_to_atom("esrch") -> {ok, esrch};
+port_error_code_to_atom("eperm") -> {ok, eperm};
+port_error_code_to_atom(_) -> error.
+
+ensure_shell_command_allowed(_Cmd, _PortOpts, #state{allow_shell_commands=true}) ->
     ok;
-ensure_shell_command_allowed(Cmd, #state{allow_shell_commands=false, shell_policy=ShellPolicy}) ->
-    case is_shell_command(Cmd, ShellPolicy) of
+ensure_shell_command_allowed(Cmd, PortOpts,
+                             #state{allow_shell_commands=false, shell_policy=ShellPolicy}) ->
+    case is_shell_command(Cmd, PortOpts, ShellPolicy) of
     true  -> throw({error, shell_commands_not_allowed});
     false -> ok
     end.
 
-is_shell_command(Cmd, legacy) when is_binary(Cmd) ->
-    true;
-is_shell_command(Cmd, legacy) when is_list(Cmd) ->
-    io_lib:printable_unicode_list(Cmd);
-is_shell_command(Cmd, strict) ->
-    is_shell_command(Cmd, legacy) orelse argv_invokes_shell(Cmd);
-is_shell_command(_, _) ->
+is_shell_command(Cmd, _PortOpts, legacy) ->
+    is_binary(Cmd);
+is_shell_command(Cmd, PortOpts, strict) ->
+    is_binary(Cmd) orelse argv_invokes_shell(Cmd, PortOpts);
+is_shell_command(_, _, _) ->
     false.
 
 normalize_command(Cmd) when is_binary(Cmd) ->
@@ -1384,28 +1411,50 @@ normalize_shell_policy(legacy) -> legacy;
 normalize_shell_policy(strict) -> strict;
 normalize_shell_policy(Other) -> throw({error, {invalid_shell_policy, Other}}).
 
-argv_invokes_shell(Cmd) ->
-    case command_argv(Cmd) of
-        {ok, Argv} ->
-            argv_invokes_shell_argv(Argv, 3);
+argv_invokes_shell(Cmd, PortOpts) ->
+    case command_exec_spec(Cmd, PortOpts) of
+        {ok, Execs, Args} ->
+            lists:any(fun(Exec) -> command_invokes_shell(Exec, Args, 8) end, Execs);
         error ->
             false
     end.
 
+command_exec_spec(Cmd, PortOpts) ->
+    case command_argv(Cmd) of
+        {ok, [DefaultExec | Args]} ->
+            {ok, executable_candidates(PortOpts, DefaultExec), Args};
+        _ ->
+            error
+    end.
+
+executable_candidates(PortOpts, DefaultExec) ->
+    Execs = [Exec
+             || Value <- proplists:get_all_values(executable, PortOpts),
+                {ok, Exec} <- [command_argv_value(Value)]],
+    case Execs of
+        [] ->
+            [DefaultExec];
+        _ ->
+            lists:usort(Execs)
+    end.
+
 command_argv(Cmd) when is_list(Cmd) ->
-    case io_lib:printable_unicode_list(Cmd) of
-        true ->
-            error;
-        false ->
-            try
-                {ok, [command_argv_arg(Arg) || Arg <- Cmd]}
-            catch
-                throw:badarg ->
-                    error
-            end
+    try
+        {ok, [command_argv_arg(Arg) || Arg <- Cmd]}
+    catch
+        throw:badarg ->
+            error
     end;
 command_argv(_) ->
     error.
+
+command_argv_value(Value) ->
+    try
+        {ok, command_argv_arg(Value)}
+    catch
+        throw:badarg ->
+            error
+    end.
 
 command_argv_arg(Arg) when is_binary(Arg) ->
     binary_to_list(Arg);
@@ -1414,11 +1463,9 @@ command_argv_arg(Arg) when is_list(Arg) ->
 command_argv_arg(_) ->
     throw(badarg).
 
-argv_invokes_shell_argv([], _Depth) ->
-    false;
-argv_invokes_shell_argv(_, Depth) when Depth =< 0 ->
-    false;
-argv_invokes_shell_argv([Exe | Rest], Depth) ->
+command_invokes_shell(_Exe, _Args, Depth) when Depth =< 0 ->
+    true;
+command_invokes_shell(Exe, Args, Depth) ->
     case filename:basename(Exe) of
         Shell when Shell =:= "sh"; Shell =:= "bash"; Shell =:= "dash";
                    Shell =:= "ash"; Shell =:= "zsh"; Shell =:= "ksh";
@@ -1426,50 +1473,180 @@ argv_invokes_shell_argv([Exe | Rest], Depth) ->
                    Shell =:= "tcsh"; Shell =:= "busybox"; Shell =:= "toybox";
                    Shell =:= "pwsh"; Shell =:= "powershell" ->
             case Shell of
-                "busybox" -> busybox_invokes_shell(Rest, Depth - 1);
-                "toybox" -> busybox_invokes_shell(Rest, Depth - 1);
+                "busybox" -> busybox_invokes_shell(Args, Depth - 1);
+                "toybox" -> busybox_invokes_shell(Args, Depth - 1);
                 _ -> true
             end;
         "env" ->
-            env_invokes_shell(Rest, Depth - 1);
+            env_invokes_shell(Args, Depth - 1);
         _ ->
             false
     end.
 
 env_invokes_shell(Args, Depth) ->
-    case skip_env_prefix(Args) of
-        [Exe | Rest] -> argv_invokes_shell_argv([Exe | Rest], Depth);
-        _ -> false
+    case env_command_from_args(Args) of
+        {ok, Exe, Rest} ->
+            command_invokes_shell(Exe, Rest, Depth);
+        none ->
+            false;
+        unknown ->
+            true
     end.
 
-skip_env_prefix(["-i" | Rest]) ->
-    skip_env_prefix(Rest);
-skip_env_prefix(["--ignore-environment" | Rest]) ->
-    skip_env_prefix(Rest);
-skip_env_prefix(["-0" | Rest]) ->
-    skip_env_prefix(Rest);
-skip_env_prefix(["--null" | Rest]) ->
-    skip_env_prefix(Rest);
-skip_env_prefix(["-v" | Rest]) ->
-    skip_env_prefix(Rest);
-skip_env_prefix(["--debug" | Rest]) ->
-    skip_env_prefix(Rest);
-skip_env_prefix(["-S" | _Rest]) ->
-    [];
-skip_env_prefix(["--split-string" | _Rest]) ->
-    [];
-skip_env_prefix(["-u", _Var | Rest]) ->
-    skip_env_prefix(Rest);
-skip_env_prefix([Arg | Rest]) ->
-    case string:find(Arg, "=") of
-        nomatch -> [Arg | Rest];
-        _ -> skip_env_prefix(Rest)
+env_command_from_args(["--" | Rest]) ->
+    command_from_args(Rest);
+env_command_from_args([Arg | Rest]) ->
+    case env_option(Arg, Rest) of
+        {continue, Rest1} ->
+            env_command_from_args(Rest1);
+        {continue_split, SplitArg, Rest1} ->
+            case split_shell_words(SplitArg) of
+                {ok, SplitArgs} ->
+                    env_command_from_args(SplitArgs ++ Rest1);
+                error ->
+                    unknown
+            end;
+        command ->
+            case is_env_assignment(Arg) of
+                true -> env_command_from_args(Rest);
+                false -> command_from_args([Arg | Rest])
+            end;
+        unknown ->
+            unknown
     end;
-skip_env_prefix([]) ->
-    [].
+env_command_from_args([]) ->
+    none.
+
+command_from_args([Exe | Rest]) ->
+    {ok, Exe, Rest};
+command_from_args([]) ->
+    none.
+
+env_option("-", _Rest) ->
+    command;
+env_option(Arg, _Rest) when Arg =:= [] ->
+    command;
+env_option("--ignore-environment", Rest) ->
+    {continue, Rest};
+env_option("--null", Rest) ->
+    {continue, Rest};
+env_option("--debug", Rest) ->
+    {continue, Rest};
+env_option("--unset=" ++ _Var, Rest) ->
+    {continue, Rest};
+env_option("--chdir=" ++ _Dir, Rest) ->
+    {continue, Rest};
+env_option("--argv0=" ++ _Argv0, Rest) ->
+    {continue, Rest};
+env_option("--split-string=" ++ SplitArg, Rest) ->
+    {continue_split, SplitArg, Rest};
+env_option("--default-signal=" ++ _Signal, Rest) ->
+    {continue, Rest};
+env_option("--ignore-signal=" ++ _Signal, Rest) ->
+    {continue, Rest};
+env_option("--block-signal=" ++ _Signal, Rest) ->
+    {continue, Rest};
+env_option("--unset", [_Var | Rest]) ->
+    {continue, Rest};
+env_option("--chdir", [_Dir | Rest]) ->
+    {continue, Rest};
+env_option("--argv0", [_Argv0 | Rest]) ->
+    {continue, Rest};
+env_option("--split-string", [SplitArg | Rest]) ->
+    {continue_split, SplitArg, Rest};
+env_option("--default-signal", [_Signal | Rest]) ->
+    {continue, Rest};
+env_option("--ignore-signal", [_Signal | Rest]) ->
+    {continue, Rest};
+env_option("--block-signal", [_Signal | Rest]) ->
+    {continue, Rest};
+env_option("--" ++ _Unknown, _Rest) ->
+    unknown;
+env_option([$- | ShortOpts], Rest) ->
+    parse_env_short_options(ShortOpts, Rest);
+env_option(_, _Rest) ->
+    command.
+
+parse_env_short_options([], Rest) ->
+    {continue, Rest};
+parse_env_short_options([$i | Tail], Rest) ->
+    parse_env_short_options(Tail, Rest);
+parse_env_short_options([$0 | Tail], Rest) ->
+    parse_env_short_options(Tail, Rest);
+parse_env_short_options([$v | Tail], Rest) ->
+    parse_env_short_options(Tail, Rest);
+parse_env_short_options([$u], [_Var | Rest]) ->
+    {continue, Rest};
+parse_env_short_options([$u | _Var], Rest) ->
+    {continue, Rest};
+parse_env_short_options([$C], [_Dir | Rest]) ->
+    {continue, Rest};
+parse_env_short_options([$C | _Dir], Rest) ->
+    {continue, Rest};
+parse_env_short_options([$a], [_Argv0 | Rest]) ->
+    {continue, Rest};
+parse_env_short_options([$a | _Argv0], Rest) ->
+    {continue, Rest};
+parse_env_short_options([$S], [SplitArg | Rest]) ->
+    {continue_split, SplitArg, Rest};
+parse_env_short_options([$S | SplitArg], Rest) ->
+    {continue_split, SplitArg, Rest};
+parse_env_short_options([$- | _], _Rest) ->
+    unknown;
+parse_env_short_options([_Unknown | _], _Rest) ->
+    unknown.
+
+is_env_assignment(Arg) ->
+    case string:find(Arg, "=") of
+        nomatch -> false;
+        _ -> true
+    end.
+
+split_shell_words(Arg) when is_binary(Arg) ->
+    split_shell_words(binary_to_list(Arg));
+split_shell_words(Arg) when is_list(Arg) ->
+    split_shell_words(Arg, normal, [], [], false).
+
+split_shell_words([], normal, Current, Tokens, Started) ->
+    case Started of
+        true -> {ok, lists:reverse([lists:reverse(Current) | Tokens])};
+        false -> {ok, lists:reverse(Tokens)}
+    end;
+split_shell_words([], _Mode, _Current, _Tokens, _Started) ->
+    error;
+split_shell_words([Char | Rest], normal, Current, Tokens, Started)
+  when Char =:= $\s; Char =:= $\t; Char =:= $\r; Char =:= $\n ->
+    case Started of
+        true ->
+            split_shell_words(Rest, normal, [], [lists:reverse(Current) | Tokens], false);
+        false ->
+            split_shell_words(Rest, normal, Current, Tokens, false)
+    end;
+split_shell_words([$\\, Char | Rest], normal, Current, Tokens, _Started) ->
+    split_shell_words(Rest, normal, [Char | Current], Tokens, true);
+split_shell_words([$\\], normal, _Current, _Tokens, _Started) ->
+    error;
+split_shell_words([$' | Rest], normal, Current, Tokens, _Started) ->
+    split_shell_words(Rest, single, Current, Tokens, true);
+split_shell_words([$" | Rest], normal, Current, Tokens, _Started) ->
+    split_shell_words(Rest, double, Current, Tokens, true);
+split_shell_words([Char | Rest], normal, Current, Tokens, _Started) ->
+    split_shell_words(Rest, normal, [Char | Current], Tokens, true);
+split_shell_words([$' | Rest], single, Current, Tokens, Started) ->
+    split_shell_words(Rest, normal, Current, Tokens, Started);
+split_shell_words([Char | Rest], single, Current, Tokens, _Started) ->
+    split_shell_words(Rest, single, [Char | Current], Tokens, true);
+split_shell_words([$\\, Char | Rest], double, Current, Tokens, _Started) ->
+    split_shell_words(Rest, double, [Char | Current], Tokens, true);
+split_shell_words([$\\], double, _Current, _Tokens, _Started) ->
+    error;
+split_shell_words([$" | Rest], double, Current, Tokens, Started) ->
+    split_shell_words(Rest, normal, Current, Tokens, Started);
+split_shell_words([Char | Rest], double, Current, Tokens, _Started) ->
+    split_shell_words(Rest, double, [Char | Current], Tokens, true).
 
 busybox_invokes_shell([Subcommand | Rest], Depth) ->
-    argv_invokes_shell_argv([Subcommand | Rest], Depth);
+    command_invokes_shell(Subcommand, Rest, Depth);
 busybox_invokes_shell([], _Depth) ->
     false.
 
@@ -1479,8 +1656,8 @@ check_cmd_options([sync|T], Pid, State, PortOpts, OtherOpts) ->
     check_cmd_options(T, Pid, State, PortOpts, OtherOpts);
 check_cmd_options([link|T], Pid, State, PortOpts, OtherOpts) ->
     check_cmd_options(T, Pid, State, PortOpts, OtherOpts);
-check_cmd_options([{executable,V}=H|T], Pid, State, PortOpts, OtherOpts) when is_list(V); is_binary(V) ->
-    check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
+check_cmd_options([{executable,V}|T], Pid, State, PortOpts, OtherOpts) when is_list(V); is_binary(V) ->
+    check_cmd_options(T, Pid, State, [{executable, normalize_command_arg(V)}|PortOpts], OtherOpts);
 check_cmd_options([{cd, Dir}=H|T], Pid, State, PortOpts, OtherOpts) when is_list(Dir); is_binary(Dir) ->
     check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
 check_cmd_options([{env, Env}=H|T], Pid, State, PortOpts, OtherOpts) when is_list(Env) ->
@@ -1497,8 +1674,9 @@ check_cmd_options([{kill, _Cmd}|_], _Pid, #state{allow_custom_kill_commands=fals
                   _PortOpts, _OtherOpts) ->
     throw({error, custom_kill_commands_not_allowed});
 check_cmd_options([{kill, Cmd}|T], Pid, State, PortOpts, OtherOpts) when is_list(Cmd); is_binary(Cmd) ->
-    ensure_shell_command_allowed(Cmd, State),
-    check_cmd_options(T, Pid, State, [{kill, normalize_command(Cmd)} | PortOpts], OtherOpts);
+    KillCmd = normalize_command(Cmd),
+    ensure_shell_command_allowed(KillCmd, [], State),
+    check_cmd_options(T, Pid, State, [{kill, KillCmd} | PortOpts], OtherOpts);
 check_cmd_options([{kill_timeout, I}=H|T], Pid, State, PortOpts, OtherOpts) when is_integer(I), I >= 0 ->
     check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
 check_cmd_options([kill_group=H|T], Pid, State, PortOpts, OtherOpts) ->
@@ -1690,6 +1868,9 @@ print(Stream, OsPid, Data) ->
 
 -define(tt(F), {timeout, 20, ?_test(F)}).
 
+check_receive({Stream, Pid, Bin}, _Orig, _Got, _Timeout, _TestName, _Line)
+        when is_atom(Stream), is_integer(Pid), Bin =:= <<>> ->
+    true;
 check_receive({Stream, Pid, Bin} = A, Orig, Got, Timeout, TestName, Line)
         when is_atom(Stream), is_integer(Pid), is_binary(Bin) ->
     receive
@@ -1700,11 +1881,12 @@ check_receive({Stream, Pid, Bin} = A, Orig, Got, Timeout, TestName, Line)
             case Bin of
                 <<C:Len/binary, Rest/binary>> when C == B ->
                     check_receive({Stream, Pid, Rest}, Orig, [B|Got], Timeout, TestName, Line);
-                Other ->
+                Remaining ->
                     ?debugFmt("==> TEST ~s FAILED (line: ~w)!!!\n", [TestName, Line]),
                     erlang:error(#{error    => unexpected_bytes,
                                    expected => Orig,
-                                   got      => lists:reverse([Other|Got]),
+                                   got      => lists:reverse([B|Got]),
+                                   remaining_expected => Remaining,
                                    test     => TestName,
                                    line     => Line})
                 end
@@ -1745,6 +1927,16 @@ temp_file() ->
     Dir = temp_dir(),
     {I1, I2, I3}  = erlang:timestamp(),
     filename:join(Dir, io_lib:format("exec_temp_~w_~w_~w", [I1, I2, I3])).
+
+port_error_code_normalization_test_() ->
+    [
+        ?_assertEqual({ok, {1, {error, badarg}}},
+                      decode_port_msg(term_to_binary({1, {error, "badarg"}}))),
+        ?_assertEqual({ok, {1, {error, eperm}}},
+                      decode_port_msg(term_to_binary({1, {error, "eperm"}}))),
+        ?_assertEqual({ok, {1, {error, "plain text"}}},
+                      decode_port_msg(term_to_binary({1, {error, "plain text"}})))
+    ].
 
 legacy_exec_test_opts() ->
     [{allow_shell_commands, true},
@@ -1847,18 +2039,18 @@ test_sync() ->
 
 test_winsz() ->
     {ok, P, I} = exec:run(
-        ["/bin/bash", "-i", "-c", "echo started; read x; echo LINES=$(tput lines) COLUMNS=$(tput cols)"],
-        [stdin, stdout, {stderr, stdout}, monitor, pty, {env, [{"TERM", "xterm"}]}]),
+        ["/bin/sh", "-c", "echo started; read x; stty size"],
+        [stdin, stdout, {stderr, stdout}, monitor, pty]),
     ?receiveBytes({stdout, I, <<"started\r\n">>}, 3000),
     ok = exec:winsz(I, 99, 88),
     ok = exec:send(I, <<"\n">>),
-    ?receiveBytes({stdout, I, <<"LINES=99 COLUMNS=88\r\n">>}, 3000),
+    ?receiveBytes({stdout, I, <<"99 88\r\n">>}, 3000),
     ?receivePattern({'DOWN', _, process, P, normal}, 5000),
     % can set size on run
     {ok, P2, I2} = exec:run(
-        ["/bin/bash", "-i", "-c", "echo LINES=$(tput lines) COLUMNS=$(tput cols)\n"],
-        [stdin, stdout, {stderr, stdout}, monitor, pty, {env, [{"TERM", "xterm"}]}, {winsz, {99, 88}}]),
-    ?receiveBytes({stdout, I2, <<"LINES=99 COLUMNS=88\r\n">>}, 5000),
+        ["/bin/sh", "-c", "stty size"],
+        [stdin, stdout, {stderr, stdout}, monitor, pty, {winsz, {99, 88}}]),
+    ?receiveBytes({stdout, I2, <<"99 88\r\n">>}, 5000),
     ?receivePattern({'DOWN', _, process, P2, normal}, 5000).
 
 test_stdin() ->
@@ -1868,9 +2060,11 @@ test_stdin() ->
     ?receivePattern({'DOWN', _, process, P, normal}, 5000).
 
 test_large_stdin() ->
-    {ok, Pid, _} = exec:run("cat", [stdin, stdout, stderr]),
-    ?assertEqual(ok, exec:send(Pid, erlang:list_to_binary([A rem 250 || A <- lists:seq(1,65511)]))),
-    ?assertEqual(ok, exec:send(Pid, erlang:list_to_binary([A rem 250 || A <- lists:seq(1,256*1024)]))).
+    {ok, P, I} = exec:run("cat >/dev/null", [stdin, monitor]),
+    ?assertEqual(ok, exec:send(I, erlang:list_to_binary([A rem 250 || A <- lists:seq(1,65511)]))),
+    ?assertEqual(ok, exec:send(I, erlang:list_to_binary([A rem 250 || A <- lists:seq(1,256*1024)]))),
+    ?assertEqual(ok, exec:send(I, eof)),
+    ?receivePattern({'DOWN', I, process, P, normal}, 5000).
 
 test_stdin_eof() ->
     case os:find_executable("tac") of

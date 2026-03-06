@@ -1103,7 +1103,12 @@ int send_error_str(int transId, bool asAtom, const char* fmt, ...)
     eis.encode(transId);
     eis.encodeTupleSize(2);
     eis.encode(atom_t("error"));
-    (asAtom) ? eis.encode(atom_t(str)) : eis.encode(str);
+    // Keep error replies atom-free on the native side so the Erlang side can
+    // safely decode them with binary_to_term(Bin, [safe]) without relying on
+    // the VM atom table already containing every errno-style code we emit.
+    // Known short codes are normalized back to atoms in exec.erl.
+    (void)asAtom;
+    eis.encode(str);
     return eis.write();
 }
 
