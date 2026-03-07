@@ -87,6 +87,8 @@ versa.
 -define(TIMEOUT, 30000).
 -define(MAX_PACKET_SIZE, 16#FFFF - 200). % UINT16, and keep some bytes for the header (24 should be enough).
 -define(PORT_ERROR_ATOMS, [badarg, not_found, eacces, einval, esrch, eperm]).
+-define(PORT_PROTOCOL_ATOMS, ?PORT_ERROR_ATOMS ++ [error, exit_status, ok,
+                                                   pid, stderr, stdout]).
 
 -record(state, {
     port,
@@ -786,7 +788,7 @@ default(Option) ->
 %%-----------------------------------------------------------------------
 init([Options]) ->
     process_flag(trap_exit, true),
-    _ = ?PORT_ERROR_ATOMS,
+    _ = ?PORT_PROTOCOL_ATOMS,
     Opts0 = proplists:expand([{debug,   [{debug, 1}]},
                               {root,    [{root, true}]},
                               {verbose, [{verbose, true}]}], Options),
@@ -1289,12 +1291,12 @@ decode_port_msg(Bin) ->
         error:badarg -> {error, bad_port_message}
     end.
 
-normalize_command(Cmd) when is_binary(Cmd) ->
+normalize_command(Cmd) when is_binary(Cmd), Cmd =/= <<>> ->
     Cmd;
-normalize_command(Cmd) when is_list(Cmd) ->
+normalize_command(Cmd) when is_list(Cmd), Cmd =/= [] ->
     case io_lib:printable_unicode_list(Cmd) of
         true ->
-            unicode:characters_to_binary(Cmd);
+            unicode_bin_or_badarg(Cmd);
         false ->
             [normalize_command_arg(Arg) || Arg <- Cmd]
     end;
@@ -1304,14 +1306,22 @@ normalize_command(_) ->
 normalize_command_arg(Arg) when is_binary(Arg) ->
     Arg;
 normalize_command_arg(Arg) when is_list(Arg) ->
+    unicode_bin_or_badarg(Arg);
+normalize_command_arg(_) ->
+    throw({error, badarg}).
+
+unicode_bin_or_badarg(Chars) ->
     try
-        unicode:characters_to_binary(Arg)
+        unicode:characters_to_binary(Chars)
+    of
+        Bin when is_binary(Bin) ->
+            Bin;
+        _ ->
+            throw({error, badarg})
     catch
         error:badarg ->
             throw({error, badarg})
-    end;
-normalize_command_arg(_) ->
-    throw({error, badarg}).
+    end.
 
 check_cmd_options([monitor|T], Pid, State, PortOpts, OtherOpts) ->
     check_cmd_options(T, Pid, State, PortOpts, OtherOpts);
@@ -1584,11 +1594,15 @@ temp_file() ->
     filename:join(Dir, io_lib:format("exec_temp_~w_~w_~w", [I1, I2, I3])).
 
 port_message_decode_test_() ->
-    [?_assertEqual({ok, {1, {error, Atom}}},
-                   decode_port_msg(term_to_binary({1, {error, Atom}})))
-     || Atom <- ?PORT_ERROR_ATOMS] ++
-    [?_assertEqual({ok, {1, {error, "plain text"}}},
-                   decode_port_msg(term_to_binary({1, {error, "plain text"}})))].
+    Msgs = [{0, ok},
+            {0, {stdout, 1, <<"stdout">>}},
+            {0, {stderr, 1, <<"stderr">>}},
+            {0, {exit_status, 1, 15}},
+            {1, {pid, 1}}] ++
+        [{1, {error, Atom}} || Atom <- ?PORT_ERROR_ATOMS] ++
+        [
+            {1, {error, "plain text"}}],
+    [?_assertEqual({ok, Msg}, decode_port_msg(term_to_binary(Msg))) || Msg <- Msgs].
 
 port_payload_safety_test_() ->
     [
@@ -1784,7 +1798,14 @@ test_cmd() ->
         exec:run([<<"/bin/bash">>, <<"-c">>, <<"echo ok">>], [sync, stdout])),
     ?AssertMatch(
         {ok, [{stdout, [<<"ok\n">>]}]},
-        exec:run(["/bin/echo", "ok"], [sync, stdout])).
+        exec:run(["/bin/echo", "ok"], [sync, stdout])),
+    lists:foreach(fun(Cmd) ->
+                          ?AssertMatch({error, badarg}, exec:run(Cmd, [sync, stdout]))
+                  end, [[], <<>>, [16#D800]]),
+    lists:foreach(fun(KillCmd) ->
+                          ?AssertMatch({error, badarg},
+                                       exec:run("/bin/echo ok", [{kill, KillCmd}, sync, stdout]))
+                  end, [[], <<>>]).
 
 test_executable() ->
     % Cmd given as string
