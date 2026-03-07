@@ -785,6 +785,7 @@ default(Option) ->
 %%-----------------------------------------------------------------------
 init([Options]) ->
     process_flag(trap_exit, true),
+    ok = ensure_port_error_atoms(),
     Opts0 = proplists:expand([{debug,   [{debug, 1}]},
                               {root,    [{root, true}]},
                               {verbose, [{verbose, true}]}], Options),
@@ -1282,38 +1283,16 @@ parse_env([H|T])         -> [to_list(H)|parse_env(T)].
 
 decode_port_msg(Bin) ->
     try
-        {ok, normalize_port_msg(binary_to_term(Bin, [safe]))}
+        {ok, binary_to_term(Bin, [safe])}
     catch
         error:badarg -> {error, bad_port_message}
     end.
 
-normalize_port_msg({N, Reply}) when is_integer(N), N =/= 0 ->
-    {N, normalize_port_reply(Reply)};
-normalize_port_msg(Msg) ->
-    Msg.
-
-normalize_port_reply({error, Reason}) ->
-    {error, normalize_port_error(Reason)};
-normalize_port_reply(Reply) ->
-    Reply.
-
-normalize_port_error(Reason) when is_binary(Reason) ->
-    normalize_port_error(binary_to_list(Reason));
-normalize_port_error(Reason) when is_list(Reason) ->
-    case port_error_code_to_atom(Reason) of
-        {ok, Atom} -> Atom;
-        error -> Reason
-    end;
-normalize_port_error(Reason) ->
-    Reason.
-
-port_error_code_to_atom("badarg") -> {ok, badarg};
-port_error_code_to_atom("not_found") -> {ok, not_found};
-port_error_code_to_atom("eacces") -> {ok, eacces};
-port_error_code_to_atom("einval") -> {ok, einval};
-port_error_code_to_atom("esrch") -> {ok, esrch};
-port_error_code_to_atom("eperm") -> {ok, eperm};
-port_error_code_to_atom(_) -> error.
+ensure_port_error_atoms() ->
+    %% Keep native errno-style atoms loaded so safe port decoding can still
+    %% accept atom replies for the established wire format.
+    _ = [badarg, not_found, eacces, einval, esrch, eperm],
+    ok.
 
 normalize_command(Cmd) when is_binary(Cmd) ->
     Cmd;
@@ -1609,12 +1588,10 @@ temp_file() ->
     {I1, I2, I3}  = erlang:timestamp(),
     filename:join(Dir, io_lib:format("exec_temp_~w_~w_~w", [I1, I2, I3])).
 
-port_error_code_normalization_test_() ->
+port_message_decode_test_() ->
     [
         ?_assertEqual({ok, {1, {error, badarg}}},
-                      decode_port_msg(term_to_binary({1, {error, "badarg"}}))),
-        ?_assertEqual({ok, {1, {error, eperm}}},
-                      decode_port_msg(term_to_binary({1, {error, "eperm"}}))),
+                      decode_port_msg(term_to_binary({1, {error, badarg}}))),
         ?_assertEqual({ok, {1, {error, "plain text"}}},
                       decode_port_msg(term_to_binary({1, {error, "plain text"}})))
     ].

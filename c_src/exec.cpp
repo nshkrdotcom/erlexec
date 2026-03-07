@@ -783,20 +783,26 @@ int finalize()
             if (deadline < timeout)
                 break;
 
-            double wakeup = std::max(0.1, deadline.diff(timeout));
+            TimeVal wakeup = deadline - timeout;
             for (const auto& child : children)
-                if (child.second.deadline.sec() != 0 || child.second.deadline.usec() != 0)
-                    wakeup = std::max(0.1, std::min(wakeup, child.second.deadline.diff(timeout)));
-            for (const auto& tp : transient_pids)
-                wakeup = std::max(0.1, std::min(wakeup, tp.second.second.diff(timeout)));
+                if (!child.second.deadline.zero()) {
+                    TimeVal child_wakeup = child.second.deadline - timeout;
+                    if (child_wakeup < wakeup)
+                        wakeup = child_wakeup;
+                }
+            for (const auto& tp : transient_pids) {
+                TimeVal child_wakeup = tp.second.second - timeout;
+                if (child_wakeup < wakeup)
+                    wakeup = child_wakeup;
+            }
+            if (wakeup.millisec() < 100)
+                wakeup = TimeVal(0, 100000);
 
             int cnt;
 
             fdhandler.clear();
             fdhandler.append_read_fd(sigchld_pipe[0], FdType::SIGCHILD, true);
-            int secs = int(wakeup);
-            TimeVal ts(secs, int((wakeup - secs)*1000000.0 + 0.5));
-            while ((cnt = fdhandler.wait_for_event(ts)) < 0 && errno == EINTR);
+            while ((cnt = fdhandler.wait_for_event(wakeup)) < 0 && errno == EINTR);
 
             if (cnt < 0) {
                 DEBUG(true, "Error in finalizing pselect(2): %s", strerror(errno));
@@ -810,16 +816,15 @@ int finalize()
         }
     }
 
-    // Phase 3: Final orphan reap sweep.
-    // Catch any children we may have missed (e.g., processes spawned between
-    // fork() and children map insertion, or grandchildren in our process group).
-    // This replaces the old kill(0, SIGTERM) safety net with a non-destructive
-    // waitpid sweep that only reaps our own children.
+    // Phase 3: Final waitpid sweep.
+    // Reap any direct children that exited before we could track them or
+    // process their SIGCHLD. This replaces the old kill(0, SIGTERM) safety
+    // net with a non-destructive sweep over our own children only.
     {
         int status;
         pid_t pid;
         while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-            DEBUG(debug, "Reaped orphaned child pid %d (status=%d) during finalize", pid, status);
+            DEBUG(debug, "Reaped untracked child pid %d (status=%d) during finalize", pid, status);
         }
     }
 

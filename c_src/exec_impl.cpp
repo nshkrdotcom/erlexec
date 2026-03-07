@@ -34,27 +34,28 @@ CmdArgsList materialize_kill_command(const CmdInfo& ci)
     return cmd;
 }
 
-int decode_command_value(CmdArgsList& cmd, bool& shell, std::stringstream& err, const char* label)
+int decode_command_value(Serializer& decoder, CmdArgsList& cmd, bool& shell,
+                         std::stringstream& err, const char* label)
 {
     int sz;
     std::string arg;
 
     cmd.clear();
-    if (eis.decodeStringOrBinary(arg) == 0) {
+    if (decoder.decodeStringOrBinary(arg) == 0) {
         cmd.push_back(arg);
         shell = true;
         return 0;
     }
 
-    if ((sz = eis.decodeListSize()) > 0) {
+    if ((sz = decoder.decodeListSize()) > 0) {
         for (int i = 0; i < sz; ++i) {
-            if (eis.decodeStringOrBinary(arg) < 0) {
+            if (decoder.decodeStringOrBinary(arg) < 0) {
                 err << label << " - invalid command argument #" << i;
                 return -1;
             }
             cmd.push_back(arg);
         }
-        eis.decodeListEnd();
+        decoder.decodeListEnd();
         shell = false;
         return 0;
     }
@@ -1103,12 +1104,9 @@ int send_error_str(int transId, bool asAtom, const char* fmt, ...)
     eis.encode(transId);
     eis.encodeTupleSize(2);
     eis.encode(atom_t("error"));
-    // Keep error replies atom-free on the native side so the Erlang side can
-    // safely decode them with binary_to_term(Bin, [safe]) without relying on
-    // the VM atom table already containing every errno-style code we emit.
-    // Known short codes are normalized back to atoms in exec.erl.
-    (void)asAtom;
-    eis.encode(str);
+    // Keep the old wire format for known atom-style errors while still sending
+    // descriptive free-form failures as strings.
+    (asAtom) ? eis.encode(atom_t(str)) : eis.encode(str);
     return eis.write();
 }
 
@@ -1287,7 +1285,7 @@ int CmdOptions::ei_decode(bool getcmd)
     m_nice = std::numeric_limits<int>::max();
 
     if (getcmd) {
-        if (decode_command_value(m_cmd, m_shell, m_err, "badarg: cmd") < 0) {
+        if (decode_command_value(eis, m_cmd, m_shell, m_err, "badarg: cmd") < 0) {
             int n;
             if (m_cmd.empty()) {
                 m_err.str("");
@@ -1363,7 +1361,7 @@ int CmdOptions::ei_decode(bool getcmd)
                 break;
 
             case KILL:
-                if (decode_command_value(m_kill_cmd, m_kill_cmd_shell, m_err, op.c_str()) < 0)
+                if (decode_command_value(eis, m_kill_cmd, m_kill_cmd_shell, m_err, op.c_str()) < 0)
                     return -1;
                 break;
 
