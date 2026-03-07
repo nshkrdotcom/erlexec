@@ -112,7 +112,7 @@ is properly set prior to starting the emulator.
 
 === Starting/stopping an OS process ===
 ```
-1> exec:start([]).                                      % Start the port program.
+1> exec:start().                                        % Start the port program.
 {ok,<0.32.0>}
 2> {ok, _, I} = exec:run_link("sleep 1000", []).        % Run a shell command to sleep for 1000s.
 {ok,<0.34.0>,23584}

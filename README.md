@@ -185,7 +185,7 @@ is properly set prior to starting the emulator.
 
 ### Starting/stopping an OS process
 ```erlang
-1> exec:start([]).
+1> exec:start().
 {ok,<0.32.0>}
 2> {ok, _, I} = exec:run_link("sleep 1000", []).        % Run a shell command to sleep for 1000s.
 {ok,<0.34.0>,23584}
@@ -199,7 +199,7 @@ ok                                                      % Note that this could a
 ```
 In Elixir:
 ```elixir
-iex(1)> :exec.start([])
+iex(1)> :exec.start
 {:ok, #PID<0.112.0>}
 iex(2)> :exec.run("echo ok", [:sync, :stdout])
 {:ok, [stdout: ["ok\n"]]}

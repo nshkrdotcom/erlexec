@@ -86,6 +86,7 @@ versa.
 
 -define(TIMEOUT, 30000).
 -define(MAX_PACKET_SIZE, 16#FFFF - 200). % UINT16, and keep some bytes for the header (24 should be enough).
+-define(PORT_ERROR_ATOMS, [badarg, not_found, eacces, einval, esrch, eperm]).
 
 -record(state, {
     port,
@@ -785,7 +786,7 @@ default(Option) ->
 %%-----------------------------------------------------------------------
 init([Options]) ->
     process_flag(trap_exit, true),
-    ok = ensure_port_error_atoms(),
+    _ = ?PORT_ERROR_ATOMS,
     Opts0 = proplists:expand([{debug,   [{debug, 1}]},
                               {root,    [{root, true}]},
                               {verbose, [{verbose, true}]}], Options),
@@ -1288,12 +1289,6 @@ decode_port_msg(Bin) ->
         error:badarg -> {error, bad_port_message}
     end.
 
-ensure_port_error_atoms() ->
-    %% Keep native errno-style atoms loaded so safe port decoding can still
-    %% accept atom replies for the established wire format.
-    _ = [badarg, not_found, eacces, einval, esrch, eperm],
-    ok.
-
 normalize_command(Cmd) when is_binary(Cmd) ->
     Cmd;
 normalize_command(Cmd) when is_list(Cmd) ->
@@ -1589,12 +1584,11 @@ temp_file() ->
     filename:join(Dir, io_lib:format("exec_temp_~w_~w_~w", [I1, I2, I3])).
 
 port_message_decode_test_() ->
-    [
-        ?_assertEqual({ok, {1, {error, badarg}}},
-                      decode_port_msg(term_to_binary({1, {error, badarg}}))),
-        ?_assertEqual({ok, {1, {error, "plain text"}}},
-                      decode_port_msg(term_to_binary({1, {error, "plain text"}})))
-    ].
+    [?_assertEqual({ok, {1, {error, Atom}}},
+                   decode_port_msg(term_to_binary({1, {error, Atom}})))
+     || Atom <- ?PORT_ERROR_ATOMS] ++
+    [?_assertEqual({ok, {1, {error, "plain text"}}},
+                   decode_port_msg(term_to_binary({1, {error, "plain text"}})))].
 
 port_payload_safety_test_() ->
     [
@@ -1609,11 +1603,11 @@ user_atom_matches_limit_users_string_test() ->
 
 argv_kill_command_test() ->
     with_exec_server(fun() ->
-        {ok, _, OsPid} = exec:run(["/bin/sleep", "30"],
-                                  [{kill, ["/bin/kill", "-TERM", "${CHILD_PID}"]},
-                                   {kill_timeout, 5}]),
-        ?assertEqual(ok, exec:stop(OsPid)),
-        ?assert(wait_until(fun() -> not pid_exists(OsPid) end, 50, 100))
+        {ok, Pid, _OsPid} = exec:run(["/bin/sleep", "30"],
+                                     [monitor,
+                                      {kill, ["/bin/kill", "-TERM", "${CHILD_PID}"]},
+                                      {kill_timeout, 5}]),
+        ?assertEqual({exit_status, 15}, exec:stop_and_wait(Pid, 5000))
     end).
 
 exec_test_() ->
@@ -2049,69 +2043,23 @@ with_exec_server(Fun) ->
     end.
 
 fake_port_payload_stops_exec(Mode) ->
-    PidFile = temp_file(),
-    _ = file:delete(PidFile),
     {ok, ExecPid} = exec:start([{portexe, fake_exec_port_path()},
                                 {env, [{"ERLEXEC_FAKE_PORT_MODE", Mode},
                                        {"ERLEXEC_FAKE_PORT_EMIT_DELAY_MS", "500"},
-                                       {"ERLEXEC_FAKE_PORT_SLEEP_MS", "1000"},
-                                       {"ERLEXEC_FAKE_PORT_PID_FILE", PidFile}]}]),
-    Ref = erlang:monitor(process, ExecPid),
+                                       {"ERLEXEC_FAKE_PORT_SLEEP_MS", "1000"}]}]),
+    #state{port = Port} = sys:get_state(ExecPid),
+    ExecRef = erlang:monitor(process, ExecPid),
+    PortRef = erlang:monitor(port, Port),
     try
-        receive
-            {'DOWN', Ref, process, ExecPid, bad_port_message} ->
-                ok
-        after 5000 ->
-            ?assert(false)
-        end,
-        ?assertEqual(undefined, whereis(exec)),
-        PortPid = read_pid_file(PidFile, 20),
-        ?assert(is_integer(PortPid)),
-        ?assert(wait_until(fun() -> not pid_exists(PortPid) end, 50, 100))
+        ?receivePattern({'DOWN', PortRef, port, Port, normal}, 5000),
+        ?receivePattern({'DOWN', ExecRef, process, ExecPid, bad_port_message}, 5000),
+        ?assertEqual(undefined, whereis(exec))
     after
-        maybe_kill_pid(read_pid_file(PidFile, 1)),
-        _ = file:delete(PidFile)
+        exit(ExecPid, kill)
     end.
 
 fake_exec_port_path() ->
     filename:join(code:priv_dir(erlexec), "test/fake_exec_port.escript").
-
-read_pid_file(File, Attempts) ->
-    case file:read_file(File) of
-        {ok, Bin} ->
-            list_to_integer(string:trim(binary_to_list(Bin)));
-        {error, enoent} when Attempts > 0 ->
-            timer:sleep(100),
-            read_pid_file(File, Attempts - 1);
-        {error, _} ->
-            undefined
-    end.
-
-pid_exists(undefined) ->
-    false;
-pid_exists(Pid) when is_integer(Pid), Pid > 0 ->
-    case string:trim(os:cmd("ps -o stat= -p " ++ integer_to_list(Pid) ++ " 2>/dev/null")) of
-        [] -> false;
-        [$Z | _] -> false;
-        _ -> true
-    end.
-
-maybe_kill_pid(undefined) ->
-    ok;
-maybe_kill_pid(Pid) when is_integer(Pid), Pid > 0 ->
-    _ = os:cmd("kill -9 " ++ integer_to_list(Pid) ++ " 2>/dev/null || true"),
-    ok.
-
-wait_until(_Fun, 0, _SleepMs) ->
-    false;
-wait_until(Fun, Attempts, SleepMs) ->
-    case Fun() of
-        true ->
-            true;
-        false ->
-            timer:sleep(SleepMs),
-            wait_until(Fun, Attempts - 1, SleepMs)
-    end.
 
 default_portexe_no_priv_dir_test_() ->
     Priv = code:priv_dir(erlexec),
