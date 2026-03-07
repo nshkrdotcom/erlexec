@@ -9,7 +9,6 @@ ERL_LDFLAGS  ?= $(shell erl -noshell -noinput -eval 'io:format("-L~ts", [code:li
 
 CXXFLAGS  += -std=c++17 -finline-functions -Wall -DHAVE_PTRACE -MMD
 USE_POLL  ?= 1
-SANITIZE ?=
 
 UNAME_SYS := $(shell uname -s | tr 'A-Z' 'a-z')
 
@@ -53,11 +52,6 @@ else ifneq ($(filter $(OPTIMIZE),false 0),)
   CXXFLAGS += -O0 -g
 else
   CXXFLAGS += -O$(OPTIMIZE) -g
-endif
-
-ifneq ($(strip $(SANITIZE)),)
-  CXXFLAGS += -fno-omit-frame-pointer -fsanitize=$(SANITIZE)
-  LDFLAGS  += -fno-omit-frame-pointer -fsanitize=$(SANITIZE)
 endif
 
 CXX_VSN   ?= $(shell $(CXX) --version | sed -n '1s/^[^0-9]\+\([0-9]\+\)\(.[0-9-]\)\+.*$$/\1/p')
@@ -123,9 +117,6 @@ clean:
 	rm -f $(EXE_OUTPUT) *.o *.d
 
 info:
-	@echo "CXX:     $(CXX)"
-	@echo "OPT:     $(OPTIMIZE)"
-	@echo "SAN:     $(if $(strip $(SANITIZE)),$(SANITIZE),none)"
 	@echo "SOURCES: $(SOURCES)"
 	@echo "OBJECTS: $(OBJECTS)"
 	@echo "TARGET:  $(TARGET)"

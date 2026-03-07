@@ -94,11 +94,7 @@ versa.
     limit_users = [],           % Restricted list of users allowed to run commands
     registry,                   % Pids to notify when an OsPid exits
     debug       = false,
-    root        = false,
-    shell_policy = legacy,
-    allow_manage_external_pids = false,
-    allow_shell_commands       = false,
-    allow_custom_kill_commands = false
+    root        = false
 }).
 
 -type exec_options() :: [exec_option()].
@@ -155,36 +151,12 @@ sudo pkg ins valgrind                # FreeBSD
 - `{valgrind, Command}`
   : Same as `valgrind`, but allows to specify the Valgrind command
     and its options (e.g. "/path/to/valgrind --leak-check=full")
-- `allow_manage_external_pids | {allow_manage_external_pids, Boolean}`
-  : Allow/disallow `manage/2` for arbitrary external OS pids.
-    Disabled by default.
-- `{shell_policy, Policy}`
-  : Shell-command classification policy. `legacy` preserves the
-    historical behavior where only shell-string commands are gated.
-    `strict` also classifies argv-form shell interpreter invocations
-    (for example `["/bin/sh", "-c", "echo ok"]` or
-    `["/usr/bin/env", "sh", "-c", "echo ok"]`) as shell commands.
-    Default: `legacy`.
-- `allow_shell_commands | {allow_shell_commands, Boolean}`
-  : Allow/disallow shell-string and shell-binary commands in `run/2`.
-    When `{shell_policy, strict}` is enabled this also gates argv-form
-    shell interpreter invocations and argv-form custom kill commands
-    that invoke a shell interpreter.
-    Disabled by default.
-- `allow_custom_kill_commands | {allow_custom_kill_commands, Boolean}`
-  : Allow/disallow `{kill, Cmd}` command option.
-    Disabled by default.
 """.
--type shell_policy() :: legacy | strict.
 -type exec_option()  ::
       debug
     | {debug, integer()}
     | root | {root, boolean()}
     | verbose
-    | {shell_policy, shell_policy()}
-    | allow_manage_external_pids | {allow_manage_external_pids, boolean()}
-    | allow_shell_commands | {allow_shell_commands, boolean()}
-    | allow_custom_kill_commands | {allow_custom_kill_commands, boolean()}
     | {args, [string()|binary(), ...]}
     | {alarm, non_neg_integer()}
     | {user, string()|binary()}
@@ -194,7 +166,7 @@ sudo pkg ins valgrind                # FreeBSD
     | valgrind
     | {valgrind, string()}
     .
--export_type([exec_option/0, exec_options/0, shell_policy/0]).
+-export_type([exec_option/0, exec_options/0]).
 
 -doc """
 Command to be executed. If specified as a string, the specified command
@@ -232,11 +204,7 @@ involving the shell process, so the list of strings
 represents the program to be executed given with a full path,
 followed by the list of arguments (e.g. `["/bin/echo", "ok"]`).
 In this case all shell-based features are disabled
-and there's no shell injection vulnerability, unless you
-intentionally execute a shell interpreter as argv (for example
-`["/bin/sh", "-c", "echo ok"]`). The default `{shell_policy, legacy}`
-keeps that historical behavior. Use `{shell_policy, strict}` to
-treat argv-form shell interpreter invocations as shell commands.
+and there's no shell injection vulnerability.
 """.
 -type cmd_arg() :: string() | binary().
 -type cmd() :: binary() | string() | [cmd_arg()].
@@ -756,10 +724,6 @@ default() ->
     [{debug, 0},        % Debug mode of the port program.
      {verbose, false},  % Verbose print of events on the Erlang side.
      {root, false},     % Allow running processes as root.
-     {shell_policy, legacy},
-     {allow_manage_external_pids, false},
-     {allow_shell_commands, false},
-     {allow_custom_kill_commands, false},
      {args, ""},        % Extra arguments that can be passed to port program
      {alarm, 12},
      {portexe, noportexe},
@@ -852,10 +816,6 @@ init([Options]) ->
     User  = to_list(proplists:get_value(user,Options)),
     Debug = proplists:get_value(verbose,     Options, default(verbose)),
     Root  = proplists:get_value(root,        Options, default(root)),
-    ShellPolicy = normalize_shell_policy(proplists:get_value(shell_policy, Options, default(shell_policy))),
-    AllowManageExternalPids = proplists:get_bool(allow_manage_external_pids, Options),
-    AllowShellCommands = proplists:get_bool(allow_shell_commands, Options),
-    AllowCustomKillCommands = proplists:get_bool(allow_custom_kill_commands, Options),
     Valgr = case proplists:get_value(valgrind, Options) of
             true                  -> default(valgrind);
             Vg when is_list(Vg)   -> Vg ++ " ";
@@ -901,11 +861,7 @@ init([Options]) ->
                 {stop, {port_exited_with_status, Status}}
         after 350 ->
             Tab = ets:new(exec_mon, [protected,named_table]),
-            {ok, #state{port=Port, limit_users=Users, debug=Debug, registry=Tab, root=Root,
-                        shell_policy=ShellPolicy,
-                        allow_manage_external_pids=AllowManageExternalPids,
-                        allow_shell_commands=AllowShellCommands,
-                        allow_custom_kill_commands=AllowCustomKillCommands}}
+            {ok, #state{port=Port, limit_users=Users, debug=Debug, registry=Tab, root=Root}}
         end
     catch
         ?EXCEPTION(_, Reason, Stacktrace) ->
@@ -1206,7 +1162,6 @@ check_options(Options) when is_list(Options) ->
     Users = proplists:get_value(limit_users, Options, default(limit_users)),
     User  = proplists:get_value(user,        Options),
     Root  = proplists:get_value(root,        Options, default(root)),
-    ShellPolicy = proplists:get_value(shell_policy, Options, default(shell_policy)),
     % When instructing to run as root, check that the port program has
     % the SUID bit set or else use "sudo"
     Exe   = case proplists:get_value(portexe, Options, undefined) of
@@ -1214,24 +1169,21 @@ check_options(Options) when is_list(Options) ->
                 Other     -> Other
             end,
     {SUID,NeedSudo} = is_suid_and_root_owner(Exe),
-    case lists:member(ShellPolicy, [legacy, strict]) of
-    false ->
-        {error, {invalid_shell_policy, ShellPolicy}};
-    true when Root, (User==undefined orelse User=="" orelse User == <<"">>) ->
+    if Root, (User==undefined orelse User=="" orelse User == <<"">>) ->
         % Asked to enable root, but User is not set
         {error, "Not allowed to run without providing effective user {user,User}!"};
-    true when Root, Users==[] ->
+    Root, Users==[] ->
         % Asked to enable root, have SUID
         {error, "Not allowed to run without restricting effective users {limit_users,Users}!"};
-    true when Root, User/=undefined, User/="", Users/=[] ->
+    Root, User/=undefined, User/="", Users/=[] ->
         ok;
-    true when not Root, SUID, not NeedSudo, Users==[] ->
+    not Root, SUID, not NeedSudo, Users==[] ->
         {error, "Not allowed to run as SUID root without restricting effective users {limit_users,Users}!"};
-    true when not Root, User/=undefined ->
+    not Root, User/=undefined ->
         {error, "Cannot specify effective user {user,User} in non-root mode!"};
-    true when not Root, Users/=[] ->
+    not Root, Users/=[] ->
         {error, "Cannot restrict users {limit_users,Users} in non-root mode!"};
-    true when not Root ->
+    not Root ->
         ok;
     true ->
         {error, "Invalid root and user arguments"}
@@ -1269,7 +1221,6 @@ get_transaction(Q, I, OldQ) ->
 is_port_command({{run, Cmd, Options}, Link, Sync}, Pid, State) ->
     {PortOpts, Other} = check_cmd_options(Options, Pid, State, [], []),
     Exe = normalize_command(Cmd),
-    ensure_shell_command_allowed(Exe, PortOpts, State),
     {ok, {run, Exe, PortOpts}, Link, Sync, Other};
 is_port_command({list} = T, _Pid, _State) ->
     {ok, T, undefined, undefined, []};
@@ -1280,9 +1231,6 @@ is_port_command({stop, Pid}, _Pid, _State) when is_pid(Pid) ->
     [{_StoredPid, OsPid}] -> {ok, {stop, OsPid}, undefined, undefined, []};
     []              -> throw({error, no_process})
     end;
-is_port_command({{manage, _OsPid, _Options}, _Link, _Sync}, _Pid,
-                #state{allow_manage_external_pids=false}) ->
-    throw({error, manage_external_pids_disabled});
 is_port_command({{manage, OsPid, Options}, Link, Sync}, Pid, State) when is_integer(OsPid) ->
     {PortOpts, _Other} = check_cmd_options(Options, Pid, State, [], []),
     {ok, {manage, OsPid, PortOpts}, Link, Sync, []};
@@ -1367,22 +1315,6 @@ port_error_code_to_atom("esrch") -> {ok, esrch};
 port_error_code_to_atom("eperm") -> {ok, eperm};
 port_error_code_to_atom(_) -> error.
 
-ensure_shell_command_allowed(_Cmd, _PortOpts, #state{allow_shell_commands=true}) ->
-    ok;
-ensure_shell_command_allowed(Cmd, PortOpts,
-                             #state{allow_shell_commands=false, shell_policy=ShellPolicy}) ->
-    case is_shell_command(Cmd, PortOpts, ShellPolicy) of
-    true  -> throw({error, shell_commands_not_allowed});
-    false -> ok
-    end.
-
-is_shell_command(Cmd, _PortOpts, legacy) ->
-    is_binary(Cmd);
-is_shell_command(Cmd, PortOpts, strict) ->
-    is_binary(Cmd) orelse argv_invokes_shell(Cmd, PortOpts);
-is_shell_command(_, _, _) ->
-    false.
-
 normalize_command(Cmd) when is_binary(Cmd) ->
     Cmd;
 normalize_command(Cmd) when is_list(Cmd) ->
@@ -1407,249 +1339,6 @@ normalize_command_arg(Arg) when is_list(Arg) ->
 normalize_command_arg(_) ->
     throw({error, badarg}).
 
-normalize_shell_policy(legacy) -> legacy;
-normalize_shell_policy(strict) -> strict;
-normalize_shell_policy(Other) -> throw({error, {invalid_shell_policy, Other}}).
-
-argv_invokes_shell(Cmd, PortOpts) ->
-    case command_exec_spec(Cmd, PortOpts) of
-        {ok, Execs, Args} ->
-            lists:any(fun(Exec) -> command_invokes_shell(Exec, Args, 8) end, Execs);
-        error ->
-            false
-    end.
-
-command_exec_spec(Cmd, PortOpts) ->
-    case command_argv(Cmd) of
-        {ok, [DefaultExec | Args]} ->
-            {ok, executable_candidates(PortOpts, DefaultExec), Args};
-        _ ->
-            error
-    end.
-
-executable_candidates(PortOpts, DefaultExec) ->
-    Execs = [Exec
-             || Value <- proplists:get_all_values(executable, PortOpts),
-                {ok, Exec} <- [command_argv_value(Value)]],
-    case Execs of
-        [] ->
-            [DefaultExec];
-        _ ->
-            lists:usort(Execs)
-    end.
-
-command_argv(Cmd) when is_list(Cmd) ->
-    try
-        {ok, [command_argv_arg(Arg) || Arg <- Cmd]}
-    catch
-        throw:badarg ->
-            error
-    end;
-command_argv(_) ->
-    error.
-
-command_argv_value(Value) ->
-    try
-        {ok, command_argv_arg(Value)}
-    catch
-        throw:badarg ->
-            error
-    end.
-
-command_argv_arg(Arg) when is_binary(Arg) ->
-    binary_to_list(Arg);
-command_argv_arg(Arg) when is_list(Arg) ->
-    Arg;
-command_argv_arg(_) ->
-    throw(badarg).
-
-command_invokes_shell(_Exe, _Args, Depth) when Depth =< 0 ->
-    true;
-command_invokes_shell(Exe, Args, Depth) ->
-    case filename:basename(Exe) of
-        Shell when Shell =:= "sh"; Shell =:= "bash"; Shell =:= "dash";
-                   Shell =:= "ash"; Shell =:= "zsh"; Shell =:= "ksh";
-                   Shell =:= "mksh"; Shell =:= "fish"; Shell =:= "csh";
-                   Shell =:= "tcsh"; Shell =:= "busybox"; Shell =:= "toybox";
-                   Shell =:= "pwsh"; Shell =:= "powershell" ->
-            case Shell of
-                "busybox" -> busybox_invokes_shell(Args, Depth - 1);
-                "toybox" -> busybox_invokes_shell(Args, Depth - 1);
-                _ -> true
-            end;
-        "env" ->
-            env_invokes_shell(Args, Depth - 1);
-        _ ->
-            false
-    end.
-
-env_invokes_shell(Args, Depth) ->
-    case env_command_from_args(Args) of
-        {ok, Exe, Rest} ->
-            command_invokes_shell(Exe, Rest, Depth);
-        none ->
-            false;
-        unknown ->
-            true
-    end.
-
-env_command_from_args(["--" | Rest]) ->
-    command_from_args(Rest);
-env_command_from_args([Arg | Rest]) ->
-    case env_option(Arg, Rest) of
-        {continue, Rest1} ->
-            env_command_from_args(Rest1);
-        {continue_split, SplitArg, Rest1} ->
-            case split_shell_words(SplitArg) of
-                {ok, SplitArgs} ->
-                    env_command_from_args(SplitArgs ++ Rest1);
-                error ->
-                    unknown
-            end;
-        command ->
-            case is_env_assignment(Arg) of
-                true -> env_command_from_args(Rest);
-                false -> command_from_args([Arg | Rest])
-            end;
-        unknown ->
-            unknown
-    end;
-env_command_from_args([]) ->
-    none.
-
-command_from_args([Exe | Rest]) ->
-    {ok, Exe, Rest};
-command_from_args([]) ->
-    none.
-
-env_option("-", _Rest) ->
-    command;
-env_option(Arg, _Rest) when Arg =:= [] ->
-    command;
-env_option("--ignore-environment", Rest) ->
-    {continue, Rest};
-env_option("--null", Rest) ->
-    {continue, Rest};
-env_option("--debug", Rest) ->
-    {continue, Rest};
-env_option("--unset=" ++ _Var, Rest) ->
-    {continue, Rest};
-env_option("--chdir=" ++ _Dir, Rest) ->
-    {continue, Rest};
-env_option("--argv0=" ++ _Argv0, Rest) ->
-    {continue, Rest};
-env_option("--split-string=" ++ SplitArg, Rest) ->
-    {continue_split, SplitArg, Rest};
-env_option("--default-signal=" ++ _Signal, Rest) ->
-    {continue, Rest};
-env_option("--ignore-signal=" ++ _Signal, Rest) ->
-    {continue, Rest};
-env_option("--block-signal=" ++ _Signal, Rest) ->
-    {continue, Rest};
-env_option("--unset", [_Var | Rest]) ->
-    {continue, Rest};
-env_option("--chdir", [_Dir | Rest]) ->
-    {continue, Rest};
-env_option("--argv0", [_Argv0 | Rest]) ->
-    {continue, Rest};
-env_option("--split-string", [SplitArg | Rest]) ->
-    {continue_split, SplitArg, Rest};
-env_option("--default-signal", [_Signal | Rest]) ->
-    {continue, Rest};
-env_option("--ignore-signal", [_Signal | Rest]) ->
-    {continue, Rest};
-env_option("--block-signal", [_Signal | Rest]) ->
-    {continue, Rest};
-env_option("--" ++ _Unknown, _Rest) ->
-    unknown;
-env_option([$- | ShortOpts], Rest) ->
-    parse_env_short_options(ShortOpts, Rest);
-env_option(_, _Rest) ->
-    command.
-
-parse_env_short_options([], Rest) ->
-    {continue, Rest};
-parse_env_short_options([$i | Tail], Rest) ->
-    parse_env_short_options(Tail, Rest);
-parse_env_short_options([$0 | Tail], Rest) ->
-    parse_env_short_options(Tail, Rest);
-parse_env_short_options([$v | Tail], Rest) ->
-    parse_env_short_options(Tail, Rest);
-parse_env_short_options([$u], [_Var | Rest]) ->
-    {continue, Rest};
-parse_env_short_options([$u | _Var], Rest) ->
-    {continue, Rest};
-parse_env_short_options([$C], [_Dir | Rest]) ->
-    {continue, Rest};
-parse_env_short_options([$C | _Dir], Rest) ->
-    {continue, Rest};
-parse_env_short_options([$a], [_Argv0 | Rest]) ->
-    {continue, Rest};
-parse_env_short_options([$a | _Argv0], Rest) ->
-    {continue, Rest};
-parse_env_short_options([$S], [SplitArg | Rest]) ->
-    {continue_split, SplitArg, Rest};
-parse_env_short_options([$S | SplitArg], Rest) ->
-    {continue_split, SplitArg, Rest};
-parse_env_short_options([$- | _], _Rest) ->
-    unknown;
-parse_env_short_options([_Unknown | _], _Rest) ->
-    unknown.
-
-is_env_assignment(Arg) ->
-    case string:find(Arg, "=") of
-        nomatch -> false;
-        _ -> true
-    end.
-
-split_shell_words(Arg) when is_binary(Arg) ->
-    split_shell_words(binary_to_list(Arg));
-split_shell_words(Arg) when is_list(Arg) ->
-    split_shell_words(Arg, normal, [], [], false).
-
-split_shell_words([], normal, Current, Tokens, Started) ->
-    case Started of
-        true -> {ok, lists:reverse([lists:reverse(Current) | Tokens])};
-        false -> {ok, lists:reverse(Tokens)}
-    end;
-split_shell_words([], _Mode, _Current, _Tokens, _Started) ->
-    error;
-split_shell_words([Char | Rest], normal, Current, Tokens, Started)
-  when Char =:= $\s; Char =:= $\t; Char =:= $\r; Char =:= $\n ->
-    case Started of
-        true ->
-            split_shell_words(Rest, normal, [], [lists:reverse(Current) | Tokens], false);
-        false ->
-            split_shell_words(Rest, normal, Current, Tokens, false)
-    end;
-split_shell_words([$\\, Char | Rest], normal, Current, Tokens, _Started) ->
-    split_shell_words(Rest, normal, [Char | Current], Tokens, true);
-split_shell_words([$\\], normal, _Current, _Tokens, _Started) ->
-    error;
-split_shell_words([$' | Rest], normal, Current, Tokens, _Started) ->
-    split_shell_words(Rest, single, Current, Tokens, true);
-split_shell_words([$" | Rest], normal, Current, Tokens, _Started) ->
-    split_shell_words(Rest, double, Current, Tokens, true);
-split_shell_words([Char | Rest], normal, Current, Tokens, _Started) ->
-    split_shell_words(Rest, normal, [Char | Current], Tokens, true);
-split_shell_words([$' | Rest], single, Current, Tokens, Started) ->
-    split_shell_words(Rest, normal, Current, Tokens, Started);
-split_shell_words([Char | Rest], single, Current, Tokens, _Started) ->
-    split_shell_words(Rest, single, [Char | Current], Tokens, true);
-split_shell_words([$\\, Char | Rest], double, Current, Tokens, _Started) ->
-    split_shell_words(Rest, double, [Char | Current], Tokens, true);
-split_shell_words([$\\], double, _Current, _Tokens, _Started) ->
-    error;
-split_shell_words([$" | Rest], double, Current, Tokens, Started) ->
-    split_shell_words(Rest, normal, Current, Tokens, Started);
-split_shell_words([Char | Rest], double, Current, Tokens, _Started) ->
-    split_shell_words(Rest, double, [Char | Current], Tokens, true).
-
-busybox_invokes_shell([Subcommand | Rest], Depth) ->
-    command_invokes_shell(Subcommand, Rest, Depth);
-busybox_invokes_shell([], _Depth) ->
-    false.
-
 check_cmd_options([monitor|T], Pid, State, PortOpts, OtherOpts) ->
     check_cmd_options(T, Pid, State, PortOpts, OtherOpts);
 check_cmd_options([sync|T], Pid, State, PortOpts, OtherOpts) ->
@@ -1670,12 +1359,8 @@ check_cmd_options([{env, Env}=H|T], Pid, State, PortOpts, OtherOpts) when is_lis
     [] -> check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
     L  -> throw({error, {invalid_env_value, L}})
     end;
-check_cmd_options([{kill, _Cmd}|_], _Pid, #state{allow_custom_kill_commands=false},
-                  _PortOpts, _OtherOpts) ->
-    throw({error, custom_kill_commands_not_allowed});
 check_cmd_options([{kill, Cmd}|T], Pid, State, PortOpts, OtherOpts) when is_list(Cmd); is_binary(Cmd) ->
     KillCmd = normalize_command(Cmd),
-    ensure_shell_command_allowed(KillCmd, [], State),
     check_cmd_options(T, Pid, State, [{kill, KillCmd} | PortOpts], OtherOpts);
 check_cmd_options([{kill_timeout, I}=H|T], Pid, State, PortOpts, OtherOpts) when is_integer(I), I >= 0 ->
     check_cmd_options(T, Pid, State, [H|PortOpts], OtherOpts);
@@ -1868,9 +1553,6 @@ print(Stream, OsPid, Data) ->
 
 -define(tt(F), {timeout, 20, ?_test(F)}).
 
-check_receive({Stream, Pid, Bin}, _Orig, _Got, _Timeout, _TestName, _Line)
-        when is_atom(Stream), is_integer(Pid), Bin =:= <<>> ->
-    true;
 check_receive({Stream, Pid, Bin} = A, Orig, Got, Timeout, TestName, Line)
         when is_atom(Stream), is_integer(Pid), is_binary(Bin) ->
     receive
@@ -1881,12 +1563,11 @@ check_receive({Stream, Pid, Bin} = A, Orig, Got, Timeout, TestName, Line)
             case Bin of
                 <<C:Len/binary, Rest/binary>> when C == B ->
                     check_receive({Stream, Pid, Rest}, Orig, [B|Got], Timeout, TestName, Line);
-                Remaining ->
+                Other ->
                     ?debugFmt("==> TEST ~s FAILED (line: ~w)!!!\n", [TestName, Line]),
                     erlang:error(#{error    => unexpected_bytes,
                                    expected => Orig,
-                                   got      => lists:reverse([B|Got]),
-                                   remaining_expected => Remaining,
+                                   got      => lists:reverse([Other|Got]),
                                    test     => TestName,
                                    line     => Line})
                 end
@@ -1938,10 +1619,25 @@ port_error_code_normalization_test_() ->
                       decode_port_msg(term_to_binary({1, {error, "plain text"}})))
     ].
 
-legacy_exec_test_opts() ->
-    [{allow_shell_commands, true},
-     {allow_custom_kill_commands, true},
-     {allow_manage_external_pids, true}].
+port_payload_safety_test_() ->
+    [
+        {timeout, 10, ?_test(fake_port_payload_stops_exec("invalid"))},
+        {timeout, 10, ?_test(fake_port_payload_stops_exec("unsafe_atom"))}
+    ].
+
+user_atom_matches_limit_users_string_test() ->
+    State = #state{limit_users=["root"]},
+    ?assertMatch({[{user, "root"}], []},
+                 check_cmd_options([{user, root}], self(), State, [], [])).
+
+argv_kill_command_test() ->
+    with_exec_server(fun() ->
+        {ok, _, OsPid} = exec:run(["/bin/sleep", "30"],
+                                  [{kill, ["/bin/kill", "-TERM", "${CHILD_PID}"]},
+                                   {kill_timeout, 5}]),
+        ?assertEqual(ok, exec:stop(OsPid)),
+        ?assert(wait_until(fun() -> not pid_exists(OsPid) end, 50, 100))
+    end).
 
 exec_test_() ->
     {setup,
@@ -1957,7 +1653,7 @@ exec_test_() ->
                     false -> Opts;
                     _     -> [{debug, 1}, verbose | Opts]
                 end,
-            {ok, Pid} = exec:start(legacy_exec_test_opts() ++ Opts1),
+            {ok, Pid} = exec:start(Opts1),
             Pid
         end,
 
@@ -2001,7 +1697,7 @@ exec_run_many_test_() ->
             end,
     M     = N*2,
     {setup,
-        fun()    -> {ok, Pid} = exec:start([{debug, Level} | legacy_exec_test_opts()]), Pid end,
+        fun()    -> {ok, Pid} = exec:start([{debug, Level}]), Pid end,
         fun(Pid) -> exit(Pid, kill) end,
         [
             {timeout, 200,
@@ -2060,11 +1756,9 @@ test_stdin() ->
     ?receivePattern({'DOWN', _, process, P, normal}, 5000).
 
 test_large_stdin() ->
-    {ok, P, I} = exec:run("cat >/dev/null", [stdin, monitor]),
-    ?assertEqual(ok, exec:send(I, erlang:list_to_binary([A rem 250 || A <- lists:seq(1,65511)]))),
-    ?assertEqual(ok, exec:send(I, erlang:list_to_binary([A rem 250 || A <- lists:seq(1,256*1024)]))),
-    ?assertEqual(ok, exec:send(I, eof)),
-    ?receivePattern({'DOWN', I, process, P, normal}, 5000).
+    {ok, Pid, _} = exec:run("cat", [stdin, stdout, stderr]),
+    ?assertEqual(ok, exec:send(Pid, erlang:list_to_binary([A rem 250 || A <- lists:seq(1,65511)]))),
+    ?assertEqual(ok, exec:send(Pid, erlang:list_to_binary([A rem 250 || A <- lists:seq(1,256*1024)]))).
 
 test_stdin_eof() ->
     case os:find_executable("tac") of
@@ -2367,6 +2061,80 @@ test_dynamic_pty_opts() ->
     ok = exec:send(I, <<2>>),
     ?receiveBytes({stdout, I, <<"^B">>}, 5000),
     ?receivePattern({'DOWN', I, process, P, {exit_status, 2}}, 5000).
+
+with_exec_server(Fun) ->
+    {ok, Pid} = exec:start([]),
+    try
+        Fun()
+    after
+        exit(Pid, kill),
+        timer:sleep(200)
+    end.
+
+fake_port_payload_stops_exec(Mode) ->
+    PidFile = temp_file(),
+    _ = file:delete(PidFile),
+    {ok, ExecPid} = exec:start([{portexe, fake_exec_port_path()},
+                                {env, [{"ERLEXEC_FAKE_PORT_MODE", Mode},
+                                       {"ERLEXEC_FAKE_PORT_EMIT_DELAY_MS", "500"},
+                                       {"ERLEXEC_FAKE_PORT_SLEEP_MS", "1000"},
+                                       {"ERLEXEC_FAKE_PORT_PID_FILE", PidFile}]}]),
+    Ref = erlang:monitor(process, ExecPid),
+    try
+        receive
+            {'DOWN', Ref, process, ExecPid, bad_port_message} ->
+                ok
+        after 5000 ->
+            ?assert(false)
+        end,
+        ?assertEqual(undefined, whereis(exec)),
+        PortPid = read_pid_file(PidFile, 20),
+        ?assert(is_integer(PortPid)),
+        ?assert(wait_until(fun() -> not pid_exists(PortPid) end, 50, 100))
+    after
+        maybe_kill_pid(read_pid_file(PidFile, 1)),
+        _ = file:delete(PidFile)
+    end.
+
+fake_exec_port_path() ->
+    filename:join(code:priv_dir(erlexec), "test/fake_exec_port.escript").
+
+read_pid_file(File, Attempts) ->
+    case file:read_file(File) of
+        {ok, Bin} ->
+            list_to_integer(string:trim(binary_to_list(Bin)));
+        {error, enoent} when Attempts > 0 ->
+            timer:sleep(100),
+            read_pid_file(File, Attempts - 1);
+        {error, _} ->
+            undefined
+    end.
+
+pid_exists(undefined) ->
+    false;
+pid_exists(Pid) when is_integer(Pid), Pid > 0 ->
+    case string:trim(os:cmd("ps -o stat= -p " ++ integer_to_list(Pid) ++ " 2>/dev/null")) of
+        [] -> false;
+        [$Z | _] -> false;
+        _ -> true
+    end.
+
+maybe_kill_pid(undefined) ->
+    ok;
+maybe_kill_pid(Pid) when is_integer(Pid), Pid > 0 ->
+    _ = os:cmd("kill -9 " ++ integer_to_list(Pid) ++ " 2>/dev/null || true"),
+    ok.
+
+wait_until(_Fun, 0, _SleepMs) ->
+    false;
+wait_until(Fun, Attempts, SleepMs) ->
+    case Fun() of
+        true ->
+            true;
+        false ->
+            timer:sleep(SleepMs),
+            wait_until(Fun, Attempts - 1, SleepMs)
+    end.
 
 default_portexe_no_priv_dir_test_() ->
     Priv = code:priv_dir(erlexec),

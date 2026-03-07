@@ -35,12 +35,6 @@ OS processes.
 make
 '''
 
-Canonical verification path used by CI:
-
-```
-rebar3 clean && rebar3 eunit
-'''
-
 On Linux the `exec-port' process can be enabled to execute commands under
 different effective users. In order to accomplish that, you need to set
 Linux capabilities on `exec-port' using the following command:
@@ -55,8 +49,7 @@ sudo setcap cap_setuid,cap_kill,cap_sys_nice+eip _build/default/lib/erlexec/priv
 <li>Start/stopping OS commands and getting their OS process IDs.</li>
 <li>Set OS command's working directory, environment, process group,
     effective user, process priority.</li>
-<li>Provide custom termination command for killing a process, either as a shell
-    string or a shell-free argv vector, or rely
+<li>Provide custom termination command for killing a process or relying
     on default SIGTERM/SIGKILL behavior.  Specifying custom timeout
     for SIGKILL after the termination command or SIGTERM was executed.</li>
 <li>Terminate all processing belonging to a process group</li>
@@ -76,48 +69,6 @@ sudo setcap cap_setuid,cap_kill,cap_sys_nice+eip _build/default/lib/erlexec/priv
 <li>Execute OS processes under different user credentials (using Linux
     capabilities).</li>
 </ol>
-
-== Security Policy Gates ==
-
-Starting with the latest version, erlexec enforces <b>default-deny</b> policies for
-potentially dangerous operations. The following features must be explicitly enabled
-at startup:
-
-<ul>
-<li>`shell_policy' - Shell classification mode. `legacy' preserves historical argv behavior.
-    `strict' also treats argv-form shell interpreter invocations as shell commands. Default: `legacy'.</li>
-<li>`allow_shell_commands' - Shell-string commands in `run/2' (e.g. `"echo ok"'). Default: `false'.</li>
-<li>`allow_custom_kill_commands' - `{kill, Cmd}' option for custom process termination. Default: `false'.</li>
-<li>`allow_manage_external_pids' - `manage/2' for arbitrary external OS pids. Default: `false'.</li>
-</ul>
-
-By default, `shell_policy=legacy' preserves the historical behavior where direct
-argv execution is allowed even if the argv invokes a shell interpreter such as
-`["/bin/sh", "-c", "echo ok"]'. Set `{shell_policy, strict}' to treat known shell
-interpreter argv invocations, `env'-wrapped shell invocations, and `busybox'/`toybox'
-shell subcommands as shell commands too.
-
-Prefer argv-form custom kill helpers to avoid shell parsing entirely:
-```
-{kill, ["/bin/kill", "-TERM", "${CHILD_PID}"]}
-'''
-
-To restore the previous permissive behavior:
-```
-exec:start([allow_shell_commands, allow_custom_kill_commands, allow_manage_external_pids]).
-'''
-
-To opt into the stricter shell model today:
-```
-exec:start([{shell_policy, strict}, allow_shell_commands]).
-'''
-
-== Port Protocol Safety ==
-
-Port payloads are decoded with `binary_to_term(Bin, [safe])'. If the Erlang side
-receives an invalid ETF payload or a payload that would require creating new atoms,
-the `exec' server terminates immediately with `bad_port_message'. This is intentional
-fail-closed behavior at the Erlang/native boundary.
 
 == Supported Platforms ==
 
@@ -161,7 +112,7 @@ is properly set prior to starting the emulator.
 
 === Starting/stopping an OS process ===
 ```
-1> exec:start([allow_shell_commands]).                   % Start the port program.
+1> exec:start([]).                                      % Start the port program.
 {ok,<0.32.0>}
 2> {ok, _, I} = exec:run_link("sleep 1000", []).        % Run a shell command to sleep for 1000s.
 {ok,<0.34.0>,23584}
@@ -232,7 +183,7 @@ $ whoami
 serge
 
 $ erl
-1> Opts = [root, {user, "wheel"}, {limit_users, ["alex","guest"]}, allow_shell_commands],
+1> Opts = [root, {user, "wheel"}, {limit_users, ["alex","guest"]}],
 2> exec:start(Opts).                                    % Start the port program as effective user "wheel"
                                                         % and allow it to execute commands as "alex" or "guest".
 {ok,<0.32.0>}
@@ -262,7 +213,7 @@ $ sudo _build/default/lib/erlexec/priv/*/exec-port --whoami
 root
 
 $ erl
-1> exec:start([root, {user, "root"}, {limit_users, ["root"]}, allow_shell_commands]).
+1> exec:start([root, {user, "root"}, {limit_users, ["root"]}]).
 2> exec:run("whoami", [sync, stdout]).
 {ok, [{stdout, [<<"root\n">>]}]}
 
@@ -354,9 +305,6 @@ ok
 '''
 
 === Managing an externally started OS process ===
-
-This feature requires `allow_manage_external_pids' to be enabled at startup.
-
 This command allows to instruct erlexec to begin monitoring given OS process
 and notify Erlang when the process exits. It is also able to send signals to
 the process and kill it.
@@ -394,12 +342,6 @@ ok
 '''
 
 === Specifying a custom kill command for a process ===
-
-Shell-string custom kill commands require both `allow_shell_commands' and
-`allow_custom_kill_commands' to be enabled at startup.
-
-Shell-free argv-form custom kill commands only require `allow_custom_kill_commands'.
-
 ```
 % Execute an OS process (script) that blocks SIGTERM, and uses a custom kill command,
 % which kills it with a SIGINT. Add a monitor so that we can wait for process exit
@@ -418,12 +360,6 @@ ok
 % Wait for its completion
 5> f(M), receive M -> M after 1000 -> timeout end.                                          
 {'DOWN',26347,process,<0.403.0>,normal}
-
-% Prefer argv-form kill helpers when you do not need a shell:
-6> f(I), {ok, _, I} = exec:run(["/bin/sleep", "30"],
-                               [{kill, ["/bin/kill", "-TERM", "${CHILD_PID}"]},
-                                {kill_timeout, 2}, monitor]).
-{ok,<0.404.0>,26348}
 '''
 
 === Communicating with an OS process via STDIN ===
@@ -485,28 +421,18 @@ Got: {stdout,26143,<<"baz\nbar\nfoo\n">>}
 '''
 
 === Running OS commands with/without shell ===
-
-Shell-string commands require `allow_shell_commands' to be enabled at startup.
-Argv-style commands that execute binaries directly work without it. The default
-`{shell_policy, legacy}' preserves the historical behavior where argv-form shell
-interpreters are still allowed. Use `{shell_policy, strict}' to gate those too.
-
 ```
-% Execute a command by an OS shell interpreter (requires allow_shell_commands)
-34> exec:run("echo ok", [sync, stdout]).
+% Execute a command by an OS shell interpreter
+34> exec:run("/bin/echo ok", [sync, stdout]).
 {ok, [{stdout, [<<"ok\n">>]}]}
 
-% Execute an executable without a shell (always allowed, no gate needed):
+% Execute an executable without a shell
 35> exec:run(["/bin/echo", "ok"], [sync, stdout]).
 {ok, [{stdout, [<<"ok\n">>]}]}
 
-% Historical behavior (`shell_policy=legacy', default): argv-form shell interpreters still work.
+% Execute a shell with custom options
 36> exec:run(["/bin/bash", "-c", "echo ok"], [sync, stdout]).
 {ok, [{stdout, [<<"ok\n">>]}]}
-
-% Strict mode also gates argv-form shell interpreters:
-37> exec:start([{shell_policy, strict}, allow_shell_commands]).
-{ok,<0.250.0>}
 '''
 
 === Running OS commands with pseudo terminal (pty) ===

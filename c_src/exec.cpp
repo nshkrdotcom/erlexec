@@ -769,8 +769,7 @@ int finalize()
                 ++it;
                 continue;
             }
-            if (child_exists(it->first))
-                erl_exec_kill(it->first, SIGKILL, SRCLOC);
+            erl_exec_kill(it->first, SIGKILL, SRCLOC);
             it = transient_pids.erase(it);
         }
 
@@ -784,11 +783,19 @@ int finalize()
             if (deadline < timeout)
                 break;
 
+            double wakeup = std::max(0.1, deadline.diff(timeout));
+            for (const auto& child : children)
+                if (child.second.deadline.sec() != 0 || child.second.deadline.usec() != 0)
+                    wakeup = std::max(0.1, std::min(wakeup, child.second.deadline.diff(timeout)));
+            for (const auto& tp : transient_pids)
+                wakeup = std::max(0.1, std::min(wakeup, tp.second.second.diff(timeout)));
+
             int cnt;
 
             fdhandler.clear();
             fdhandler.append_read_fd(sigchld_pipe[0], FdType::SIGCHILD, true);
-            auto ts = deadline - timeout; 
+            int secs = int(wakeup);
+            TimeVal ts(secs, int((wakeup - secs)*1000000.0 + 0.5));
             while ((cnt = fdhandler.wait_for_event(ts)) < 0 && errno == EINTR);
 
             if (cnt < 0) {
