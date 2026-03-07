@@ -4,6 +4,68 @@
 
 namespace ei {
 
+namespace {
+
+std::string replace_child_pid_token(const std::string& value, pid_t child_pid)
+{
+    static const std::string token = "${CHILD_PID}";
+
+    if (value.find(token) == std::string::npos)
+        return value;
+
+    std::string replaced = value;
+    const std::string pid = std::to_string(child_pid);
+    size_t pos = 0;
+    while ((pos = replaced.find(token, pos)) != std::string::npos) {
+        replaced.replace(pos, token.size(), pid);
+        pos += pid.size();
+    }
+    return replaced;
+}
+
+CmdArgsList materialize_kill_command(const CmdInfo& ci)
+{
+    if (ci.kill_cmd_shell)
+        return ci.kill_cmd;
+
+    CmdArgsList cmd;
+    for (const auto& arg : ci.kill_cmd)
+        cmd.push_back(replace_child_pid_token(arg, ci.cmd_pid));
+    return cmd;
+}
+
+int decode_command_value(Serializer& decoder, CmdArgsList& cmd, bool& shell,
+                         std::stringstream& err, const char* label)
+{
+    int sz;
+    std::string arg;
+
+    cmd.clear();
+    if (decoder.decodeStringOrBinary(arg) == 0) {
+        cmd.push_back(arg);
+        shell = true;
+        return 0;
+    }
+
+    if ((sz = decoder.decodeListSize()) > 0) {
+        for (int i = 0; i < sz; ++i) {
+            if (decoder.decodeStringOrBinary(arg) < 0) {
+                err << label << " - invalid command argument #" << i;
+                return -1;
+            }
+            cmd.push_back(arg);
+        }
+        decoder.decodeListEnd();
+        shell = false;
+        return 0;
+    }
+
+    err << label << " - bad option value";
+    return -1;
+}
+
+} // namespace
+
 //------------------------------------------------------------------------------
 // DARWIN doesn't have ptsname_r()
 //------------------------------------------------------------------------------
@@ -736,10 +798,9 @@ int stop_child(CmdInfo& ci, int transId, const TimeVal& now, bool notify)
 
     if (!ci.kill_cmd.empty()) {
         // This is the first attempt to kill this pid and kill command is provided.
-        CmdArgsList kill_cmd;
-        kill_cmd.push_front(ci.kill_cmd.c_str());
+        CmdArgsList kill_cmd = materialize_kill_command(ci);
         MapEnv env{{"CHILD_PID", std::to_string(ci.cmd_pid)}};
-        CmdOptions co(kill_cmd, NULL, env,
+        CmdOptions co(kill_cmd, ci.kill_cmd_shell, NULL, env,
                       std::numeric_limits<int>::max(), // user
                       std::numeric_limits<int>::max(), // nice
                       std::numeric_limits<int>::max(), // group
@@ -752,8 +813,8 @@ int stop_child(CmdInfo& ci, int transId, const TimeVal& now, bool notify)
         std::string err;
         ci.kill_cmd_pid = start_child(co, err);
         if (!err.empty())
-           DEBUG(debug, "Error executing kill command '%s': %s\r\r",
-                 ci.kill_cmd.c_str(), err.c_str());
+           DEBUG(debug, "Error executing kill command for pid %d: %s\r\r",
+                 ci.cmd_pid, err.c_str());
 
         if (ci.kill_cmd_pid > 0) {
             ci.deadline.set(now, ci.kill_timeout);
@@ -792,8 +853,10 @@ int stop_child(CmdInfo& ci, int transId, const TimeVal& now, bool notify)
             ci.sigkill = true;
             DEBUG(debug, "Failed to kill %s %d - leaving a zombie", spid, abs(pid));
             auto it = children.find(ci.cmd_pid);
-            if (it != children.end())
+            if (it != children.end()) {
                 erase_child(it);
+                return n;
+            }
         }
         ci.sigterm = true;
         return n;
@@ -1041,6 +1104,8 @@ int send_error_str(int transId, bool asAtom, const char* fmt, ...)
     eis.encode(transId);
     eis.encodeTupleSize(2);
     eis.encode(atom_t("error"));
+    // Keep the old wire format for known atom-style errors while still sending
+    // descriptive free-form failures as strings.
     (asAtom) ? eis.encode(atom_t(str)) : eis.encode(str);
     return eis.write();
 }
@@ -1214,29 +1279,20 @@ int CmdOptions::ei_decode(bool getcmd)
     m_cmd.clear();
     m_kill_cmd.clear();
     m_env.clear();
+    m_shell = true;
+    m_kill_cmd_shell = true;
 
     m_nice = std::numeric_limits<int>::max();
 
     if (getcmd) {
-        std::string s;
-
-        if (eis.decodeStringOrBinary(s) == 0) {
-            m_cmd.push_front(s);
-            m_shell=true;
-        } else if ((sz = eis.decodeListSize()) > 0) {
-            for (int i=0; i < sz; i++) {
-                if (eis.decodeStringOrBinary(s) < 0) {
-                    m_err << "badarg: invalid command argument #" << i;
-                    return -1;
-                }
-                m_cmd.push_back(s);
-            }
-            eis.decodeListEnd();
-            m_shell = false;
-        } else {
+        if (decode_command_value(eis, m_cmd, m_shell, m_err, "badarg: cmd") < 0) {
             int n;
-            m_err << "badarg: cmd string, binary, or non-empty list is expected (type="
-                  << eis.decodeType(n) << ')';
+            if (m_cmd.empty()) {
+                m_err.str("");
+                m_err.clear();
+                m_err << "badarg: cmd string, binary, or non-empty list is expected (type="
+                      << eis.decodeType(n) << ')';
+            }
             return -1;
         }
     }
@@ -1305,10 +1361,8 @@ int CmdOptions::ei_decode(bool getcmd)
                 break;
 
             case KILL:
-                // {kill, Cmd::string()}
-                if (eis.decodeStringOrBinary(m_kill_cmd) < 0) {
-                    m_err << op << " - bad option value"; return -1;
-                }
+                if (decode_command_value(eis, m_kill_cmd, m_kill_cmd_shell, m_err, op.c_str()) < 0)
+                    return -1;
                 break;
 
             case GROUP: {
@@ -1333,13 +1387,11 @@ int CmdOptions::ei_decode(bool getcmd)
                 break;
             }
             case USER:
-                // {user, Dir::string()|binary()} | {kill, Cmd::string()|binary()}
+                // {user, Dir::string()|binary()}
                 if (eis.decodeStringOrBinary(val) < 0) {
                     m_err << op << " - bad option value"; return -1;
                 }
-                if      (opt == CD)     m_cd        = val;
-                else if (opt == KILL)   m_kill_cmd  = val;
-                else if (opt == USER) {
+                if (opt == USER) {
                     struct passwd *pw = getpwnam(val.c_str());
                     if (pw == NULL) {
                         m_err << "Invalid user " << val << ": " << ::strerror(errno);
@@ -1627,4 +1679,3 @@ int CmdOptions::init_cenv()
 }
 
 } // namespace ei
-

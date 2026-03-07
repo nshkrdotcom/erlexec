@@ -371,7 +371,8 @@ bool process_command(bool is_err)
                 return true;
             }
 
-            children.emplace(realpid, CmdInfo(true, po.kill_cmd(), realpid, po.success_exit_code(),
+            children.emplace(realpid, CmdInfo(true, po.kill_cmd(), po.kill_cmd_shell(),
+                                              realpid, po.success_exit_code(),
                                               po.kill_group(), po.dbg(), po.kill_timeout()));
 
             // Set nice priority for managed process if option is present
@@ -398,7 +399,7 @@ bool process_command(bool is_err)
             if ((pid = start_child(po, err)) < 0)
                 send_error_str(transId, false, "Couldn't start pid: %s", err.c_str());
             else {
-                children.emplace(pid, CmdInfo(po.cmd(), po.kill_cmd(), pid,
+                children.emplace(pid, CmdInfo(po.cmd(), po.kill_cmd(), po.kill_cmd_shell(), pid,
                                               getpgid(pid),
                                               po.success_exit_code(), false,
                                               po.stream_fd(STDIN_FILENO),
@@ -700,33 +701,79 @@ int finalize()
     int old_terminated = terminated ? 1 : 0;
     terminated = false;
 
-    kill(0, SIGTERM); // Kill all children in our process group
-
     TimeVal now(TimeVal::NOW);
     TimeVal deadline(now, FINALIZE_DEADLINE_SEC, 0);
 
-    while (!children.empty()) {
+    auto signal_child = [](const MapChildrenT::value_type& child, int sig) {
+        pid_t pid = child.first;
+        if (pid == self_pid)
+            return;
+
+        if (child.second.kill_group &&
+            child.second.cmd_gid != std::numeric_limits<int>::max() &&
+            child.second.cmd_gid != 0) {
+            erl_exec_kill(-child.second.cmd_gid, sig, SRCLOC);
+        } else {
+            erl_exec_kill(pid, sig, SRCLOC);
+        }
+    };
+
+    // Phase 1: Send initial SIGTERM to all managed children and their groups.
+    // This is the targeted replacement for the former kill(0, SIGTERM) which
+    // indiscriminately killed the entire process group (potentially including
+    // the BEAM VM if sharing a group).
+    for (const auto& child : children)
+        signal_child(child, SIGTERM);
+
+    // Phase 2: Iteratively stop children and drain transient kill-command pids.
+    // Loop continues while there are managed children OR outstanding transient
+    // kill-command processes. The old code only checked children, which could
+    // leave custom kill helpers running after finalize returned.
+    while (!children.empty() || !transient_pids.empty()) {
         now.now();
+
+        if (deadline < now) {
+            DEBUG(debug, "Finalize deadline exceeded, force-killing remaining children");
+            // Force-kill everything remaining
+            for (const auto& child : children)
+                signal_child(child, SIGKILL);
+            for (const auto& tp : transient_pids)
+                erl_exec_kill(tp.first, SIGKILL, SRCLOC);
+            break;
+        }
+
         if (!children.empty() || !exited_children.empty()) {
             bool term = false;
             check_children(now, term, pipe_valid);
         }
 
-        for(auto it=children.begin(), end=children.end(); it != end; ++it)
-            stop_child(it->second, 0, now, false);
+        // Snapshot children pids to avoid iterator invalidation:
+        // stop_child() may call erase_child() or insert into transient_pids.
+        std::list<pid_t> managed_pids;
+        for (const auto& child : children)
+            managed_pids.push_back(child.first);
 
-        // Check if we need to kill the custom kill commands, but give then enough
-        // time to execute the kill action.
-        for(auto it=transient_pids.begin(), end=transient_pids.end(); it != end; ++it) {
-            auto& pid_deadline = it->second.second;
-            if ((now - pid_deadline).millisec() < 100)
-                continue;
-            if (child_exists(it->first))
-                erl_exec_kill(it->first, SIGKILL, SRCLOC);
-            transient_pids.erase(it);
+        for (pid_t pid : managed_pids) {
+            auto it = children.find(pid);
+            if (it != children.end())
+                stop_child(it->second, 0, now, false);
         }
 
-        if (children.empty())
+        // Reap transient kill-command pids that have exceeded their deadline.
+        for (auto it=transient_pids.begin(); it != transient_pids.end();) {
+            auto& pid_deadline = it->second.second;
+            // Check if the kill command's deadline has passed.
+            // diff() returns (pid_deadline - now) in seconds; if <= 0, deadline
+            // has passed. We allow 100ms grace.
+            if (pid_deadline.diff(now) > 0.1) {
+                ++it;
+                continue;
+            }
+            erl_exec_kill(it->first, SIGKILL, SRCLOC);
+            it = transient_pids.erase(it);
+        }
+
+        if (children.empty() && transient_pids.empty())
             break;
 
         FdHandler fdhandler;
@@ -736,12 +783,26 @@ int finalize()
             if (deadline < timeout)
                 break;
 
+            TimeVal wakeup = deadline - timeout;
+            for (const auto& child : children)
+                if (!child.second.deadline.zero()) {
+                    TimeVal child_wakeup = child.second.deadline - timeout;
+                    if (child_wakeup < wakeup)
+                        wakeup = child_wakeup;
+                }
+            for (const auto& tp : transient_pids) {
+                TimeVal child_wakeup = tp.second.second - timeout;
+                if (child_wakeup < wakeup)
+                    wakeup = child_wakeup;
+            }
+            if (wakeup.millisec() < 100)
+                wakeup = TimeVal(0, 100000);
+
             int cnt;
 
             fdhandler.clear();
             fdhandler.append_read_fd(sigchld_pipe[0], FdType::SIGCHILD, true);
-            auto ts = deadline - timeout; 
-            while ((cnt = fdhandler.wait_for_event(ts)) < 0 && errno == EINTR);
+            while ((cnt = fdhandler.wait_for_event(wakeup)) < 0 && errno == EINTR);
 
             if (cnt < 0) {
                 DEBUG(true, "Error in finalizing pselect(2): %s", strerror(errno));
@@ -752,6 +813,18 @@ int finalize()
                     if (!process_sigchld())
                         break;
             }
+        }
+    }
+
+    // Phase 3: Final waitpid sweep.
+    // Reap any direct children that exited before we could track them or
+    // process their SIGCHLD. This replaces the old kill(0, SIGTERM) safety
+    // net with a non-destructive sweep over our own children only.
+    {
+        int status;
+        pid_t pid;
+        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            DEBUG(debug, "Reaped untracked child pid %d (status=%d) during finalize", pid, status);
         }
     }
 

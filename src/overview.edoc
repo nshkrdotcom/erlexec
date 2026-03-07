@@ -72,7 +72,7 @@ sudo setcap cap_setuid,cap_kill,cap_sys_nice+eip _build/default/lib/erlexec/priv
 
 == Supported Platforms ==
 
-Linux, Solaris, and MacOS X.
+Linux, Solaris, FreeBSD, DragonFly, OpenBSD, and MacOS X.
 
 == Architecture ==
 ```
@@ -112,7 +112,7 @@ is properly set prior to starting the emulator.
 
 === Starting/stopping an OS process ===
 ```
-1> exec:start([]).                                      % Start the port program.
+1> exec:start().                                        % Start the port program.
 {ok,<0.32.0>}
 2> {ok, _, I} = exec:run_link("sleep 1000", []).        % Run a shell command to sleep for 1000s.
 {ok,<0.34.0>,23584}
@@ -427,11 +427,11 @@ Got: {stdout,26143,<<"baz\nbar\nfoo\n">>}
 {ok, [{stdout, [<<"ok\n">>]}]}
 
 % Execute an executable without a shell
-35> exec:run(["/bin/echo", "ok"], [sync, stdout])).
+35> exec:run(["/bin/echo", "ok"], [sync, stdout]).
 {ok, [{stdout, [<<"ok\n">>]}]}
 
 % Execute a shell with custom options
-36> exec:run(["/bin/bash", "-c", "echo ok"], [sync, stdout])).
+36> exec:run(["/bin/bash", "-c", "echo ok"], [sync, stdout]).
 {ok, [{stdout, [<<"ok\n">>]}]}
 '''
 

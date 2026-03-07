@@ -188,7 +188,8 @@ private:
     std::string             m_executable;
     CmdArgsList             m_cmd;
     std::string             m_cd;
-    std::string             m_kill_cmd;
+    CmdArgsList             m_kill_cmd;
+    bool                    m_kill_cmd_shell = true;
     int                     m_kill_timeout = KILL_TIMEOUT_SEC;
     bool                    m_kill_group = false;
     bool                    m_is_kill_cmd; // true if this represents a custom kill command
@@ -225,9 +226,10 @@ public:
     {
         init_streams();
     }
-    CmdOptions(const CmdArgsList& cmd, const char* cd, const MapEnv& env,
+    CmdOptions(const CmdArgsList& cmd, bool shell, const char* cd, const MapEnv& env,
                int user, int nice, int group, bool is_kill_cmd)
-        : m_cmd(cmd), m_cd(cd ? cd : "")
+        : m_shell(shell)
+        , m_cmd(cmd), m_cd(cd ? cd : "")
         , m_is_kill_cmd(is_kill_cmd)
         , m_env(env)
         , m_nice(nice)
@@ -257,7 +259,8 @@ public:
     MapEnv const& mapenv()              const { return m_env; }
     char* const*  env()                 const { return (char* const*)m_cenv; }
     int           dbg()                 const { return m_debug; }
-    const char*   kill_cmd()            const { return m_kill_cmd.c_str(); }
+    const CmdArgsList& kill_cmd()       const { return m_kill_cmd; }
+    bool          kill_cmd_shell()      const { return m_kill_cmd_shell; }
     int           kill_timeout()        const { return m_kill_timeout; }
     bool          kill_group()          const { return m_kill_group; }
     bool          is_kill_cmd()         const { return m_is_kill_cmd; }
@@ -309,7 +312,8 @@ struct CmdInfo {
     CmdArgsList     cmd;                // Executed command
     pid_t           cmd_pid;            // Pid of the custom kill command
     pid_t           cmd_gid;            // Command's group ID
-    std::string     kill_cmd;           // Kill command to use (default: use SIGTERM)
+    CmdArgsList     kill_cmd;           // Kill command to use (default: use SIGTERM)
+    bool            kill_cmd_shell = true; // True when kill command must run via shell
     kill_cmd_pid_t  kill_cmd_pid   = -1;// Pid of the command that <pid> is supposed to kill
     ei::TimeVal     deadline;           // Time when the <cmd_pid> is supposed to be killed using SIGTERM.
     bool            sigterm = false;    // <true> if sigterm was issued.
@@ -335,20 +339,22 @@ struct CmdInfo {
     // enable default move constructor to be able to put it into a map via emplace
     CmdInfo(CmdInfo&& ci) = default;
 
-    CmdInfo(bool _managed, const char* _kill_cmd, pid_t _cmd_pid, int _ok_code,
+    CmdInfo(bool _managed, const CmdArgsList& _kill_cmd, bool _kill_cmd_shell, pid_t _cmd_pid, int _ok_code,
             bool _kill_group, int _debug, int _kill_timeout)
-        : CmdInfo(cmd, _kill_cmd, _cmd_pid, getpgid(_cmd_pid), _ok_code, _managed,
+        : CmdInfo(CmdArgsList{}, _kill_cmd, _kill_cmd_shell, _cmd_pid, getpgid(_cmd_pid), _ok_code, _managed,
                   REDIRECT_NULL, REDIRECT_NONE, REDIRECT_NONE, _kill_timeout,
                   _kill_group, _debug)
     {}
   
-    CmdInfo(const CmdArgsList& _cmd, const char* _kill_cmd, pid_t _cmd_pid, pid_t _cmd_gid,
+    CmdInfo(const CmdArgsList& _cmd, const CmdArgsList& _kill_cmd, bool _kill_cmd_shell,
+            pid_t _cmd_pid, pid_t _cmd_gid,
             int _success_code, bool _managed, int _stdin_fd, int _stdout_fd, int _stderr_fd,
             int _kill_timeout, bool _kill_group, int _debug)
         : cmd(_cmd)
         , cmd_pid(_cmd_pid)
         , cmd_gid(_cmd_gid)
         , kill_cmd(_kill_cmd)
+        , kill_cmd_shell(_kill_cmd_shell)
         , kill_timeout(_kill_timeout)
         , kill_group(_kill_group)
         , success_code(_success_code)

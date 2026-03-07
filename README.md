@@ -185,19 +185,26 @@ is properly set prior to starting the emulator.
 
 ### Starting/stopping an OS process
 ```erlang
-1> exec:start().                                        % Start the port program.
+1> exec:start().
 {ok,<0.32.0>}
 2> {ok, _, I} = exec:run_link("sleep 1000", []).        % Run a shell command to sleep for 1000s.
 {ok,<0.34.0>,23584}
 3> exec:stop(I).                                        % Kill the shell command.
 ok                                                      % Note that this could also be accomplished
                                                         % by doing exec:stop(pid(0,34,0)).
+
+%% Alternatively, use argv-style commands (always allowed, no shell needed):
+4> {ok, _, I2} = exec:run_link(["/bin/sleep", "1000"], []).
+{ok,<0.36.0>,23585}
 ```
 In Elixir:
 ```elixir
 iex(1)> :exec.start
 {:ok, #PID<0.112.0>}
 iex(2)> :exec.run("echo ok", [:sync, :stdout])
+{:ok, [stdout: ["ok\n"]]}
+
+iex(3)> :exec.run(["/bin/echo", "ok"], [:sync, :stdout])
 {:ok, [stdout: ["ok\n"]]}
 ```
 
@@ -510,16 +517,15 @@ Got: {stdout,26143,<<"baz\nbar\nfoo\n">>}
 ### Running OS commands with/without shell
 ```erlang
 % Execute a command by an OS shell interpreter
-34> exec:run("echo ok", [sync, stdout]).
+34> exec:run("/bin/echo ok", [sync, stdout]).
 {ok, [{stdout, [<<"ok\n">>]}]}
 
-% Execute an executable without a shell (note that in this case
-% the full path to the executable is required):
-35> exec:run(["/bin/echo", "ok"], [sync, stdout])).
+% Execute an executable without a shell
+35> exec:run(["/bin/echo", "ok"], [sync, stdout]).
 {ok, [{stdout, [<<"ok\n">>]}]}
 
 % Execute a shell with custom options
-36> exec:run(["/bin/bash", "-c", "echo ok"], [sync, stdout])).
+36> exec:run(["/bin/bash", "-c", "echo ok"], [sync, stdout]).
 {ok, [{stdout, [<<"ok\n">>]}]}
 ```
 
